@@ -55,4 +55,32 @@ This project keeps the *algorithm* and discards the pipeline:
    degenerate, so the level count is reduced to keep at least 16 voxels on the shortest
    axis. A warning is printed whenever this happens.
 
-Both deviations only affect inputs on which the upstream constants fail outright.
+3. **The deformable control-grid spacing is capped to the image size**, for the same
+   reason as the pyramid: the upstream 30-voxel coarsest grid assumes a full-size volume,
+   and on a small image it leaves a 1-node grid with nothing to optimize. A warning is
+   printed when it applies.
+
+Deviations 1-3 only affect inputs on which the upstream constants fail outright.
+
+### Bugs fixed while porting
+
+These are defects in the original, not consequences of the port:
+
+- **`delete x;` on array allocations** (11 sites) is undefined behaviour; changed to
+  `delete[] x;`.
+- **The random sample index could run one past the end.**
+  `i1 = (int)(rand() * pow(gridstep,3) / float(RAND_MAX))` reaches `gridstep^3` exactly
+  when `rand()` returns `RAND_MAX`, and the result is used unguarded to offset into the
+  image. On glibc (`RAND_MAX` = 2^31-1) that is a 1-in-2-billion event and effectively
+  invisible; with the Microsoft CRT (`RAND_MAX` = 32767) it is near-certain across the
+  ~65k draws per level, and it access-violated immediately. The index is now clamped.
+- **A progress divisor could be zero.** `frac = sz1 / 25` is 0 whenever there are fewer
+  than 25 grid nodes, and `i % frac` then divides by zero. Guarded at both sites.
+
+### Observation
+
+`fixedInd` / `movingiInd` and the `NumBin` / `MaxFixed` / `MaxMoving` settings are
+allocated, filled and freed but never read: the deformable similarity term is an
+uncentered cross-correlation, not a histogram metric. They appear to be vestigial from an
+earlier mutual-information implementation. They are kept here so the port stays faithful,
+but they do not affect the result.

@@ -20,10 +20,12 @@ what derives from upstream and what changed.
 |---|---|
 | Rigid (versor) — Mattes mutual information | **working** |
 | Affine — Mattes mutual information | **working** |
-| Deformable — discrete symmetric B-spline MRF | not yet implemented |
+| Deformable — discrete symmetric MRF, cross-correlation | **working** |
 
-Requesting `--stages ... ,deformable` currently exits with an error rather than silently
-producing a linear-only result.
+All three stages run. The deformable stage is the distinctive one: displacements live on
+a control grid and are chosen by discrete optimization (minimum-spanning-tree message
+passing over a label space) rather than continuous gradient descent, and it is run
+forward and backward each level and composed, giving a symmetric field.
 
 ## Build
 
@@ -58,7 +60,11 @@ Run `gridpoint --help` for the full list. Common options:
 | `--fixed-mask` / `--moving-mask` | metric masks |
 | `--threads N` | thread cap |
 | `--levels N` | multi-resolution levels (default 4 ⇒ shrink 8,4,2,1) |
-| `--bins`, `--linear-samples`, `--linear-iterations` | mutual-information knobs |
+| `--bins`, `--linear-samples`, `--linear-iterations` | linear mutual-information knobs |
+| `--grid 30,15,8,4` | deformable control-grid schedule, voxels (coarsest first) |
+| `--lambda 1e-5` | deformable smoothness weight |
+| `--samples 1024` | deformable random samples per node |
+| `--write-deformation-field` | also write the dense displacement field |
 | `--translation-scale`, `--max-step`, `--min-step` | optimizer scaling (auto by default) |
 | `--upstream-optimizer` | use the original Allen constants verbatim |
 | `--warped-ext .nii` | warped-image extension (default `.nii.gz`) |
@@ -73,8 +79,9 @@ Outputs, written into `out_dir`:
 
 ## Validation
 
-On synthetic pairs with a known translation, the recovered transform matches exactly and
-the warped image is identical to the fixed image (normalized cross-correlation 1.0000):
+**Linear stages.** On synthetic pairs with a known translation the recovered transform
+matches exactly and the warped image is identical to the fixed image (normalized
+cross-correlation 1.0000):
 
 | Case | Recovered translation | Expected | NCC after |
 |---|---|---|---|
@@ -82,6 +89,23 @@ the warped image is identical to the fixed image (normalized cross-correlation 1
 | 96³, shift 7 vox | `+7.000, 0, 0` | `+7, 0, 0` | 1.0000 |
 | 128³, shift 10 vox | `+10.000, 0, 0` | `+10, 0, 0` | 1.0000 |
 | 96³, spacing 0.025 | `+0.175, 0, 0` | `+0.175, 0, 0` | 1.0000 |
+
+**Deformable stage.** On a textured 96³ phantom warped by a known sinusoidal field, the
+deformable stage adds exactly what it should: little when the deformation is gentle
+enough for an affine to absorb, a lot when it is local.
+
+| Applied warp | before | linear only | linear + deformable | gain |
+|---|---|---|---|---|
+| amplitude 4 vox, 1 cycle | 0.8395 | 0.9862 | 0.9882 | +0.0019 |
+| amplitude 8 vox, 2 cycles | 0.7260 | 0.8021 | **0.8577** | **+0.0556** |
+| amplitude 6 vox, 3 cycles | 0.7888 | 0.7734 | **0.8556** | **+0.0822** |
+| amplitude 10 vox, 3 cycles | 0.6492 | 0.6766 | **0.7193** | **+0.0427** |
+
+A caveat worth knowing: the similarity term is an *uncentered* cross-correlation over
+sampled voxels, so it is nearly flat inside large uniform regions and label choice there
+is arbitrary. On a phantom of constant-valued blocks the deformable stage can therefore
+make an already-good alignment slightly worse. Real anatomy is textured everywhere and
+does not show this.
 
 ## Using it from Python
 

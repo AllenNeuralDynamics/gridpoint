@@ -10,8 +10,10 @@
  *  ordinary 3D volumes rather than a LIMS image series + model directory.
  *
  *=========================================================================*/
+#include "StptDeformableMRF.h"
 #include "StptLinearRegistration.h"
 
+#include "itkIdentityTransform.h"
 #include "itkImageFileReader.h"
 #include "itkImageFileWriter.h"
 #include "itkLinearInterpolateImageFunction.h"
@@ -116,7 +118,8 @@ main(int argc, char * argv[])
   bool        writeDeformationField = false;
   int         threads = 0;
 
-  stpt::LinearParameters params;
+  stpt::LinearParameters     params;
+  stpt::DeformableParameters defParams;
 
   // The upstream optimizer constants are calibrated to the Allen data's physical units and
   // diverge on images of other sizes, so by default we derive them from the image geometry.
@@ -149,7 +152,7 @@ main(int argc, char * argv[])
       else if (arg == "--bins") { params.numberOfHistogramBins = std::stoul(next("--bins")); }
       else if (arg == "--linear-samples") { params.numberOfSpatialSamples = std::stoul(next("--linear-samples")); }
       else if (arg == "--linear-iterations") { params.numberOfIterations = std::stoul(next("--linear-iterations")); }
-      else if (arg == "--levels") { params.numberOfLevels = std::stoul(next("--levels")); }
+      else if (arg == "--levels") { params.numberOfLevels = std::stoul(next("--levels")); defParams.numLevels = static_cast<int>(params.numberOfLevels); }
       else if (arg == "--angle-scale") { params.angleScale = std::stod(next("--angle-scale")); }
       else if (arg == "--matrix-scale") { params.matrixScale = std::stod(next("--matrix-scale")); }
       else if (arg == "--translation-scale") { params.translationScale = std::stod(next("--translation-scale")); userSetTranslationScale = true; }
@@ -157,8 +160,8 @@ main(int argc, char * argv[])
       else if (arg == "--min-step") { params.minimumStepLength = std::stod(next("--min-step")); userSetMinStep = true; }
       else if (arg == "--upstream-optimizer") { upstreamOptimizer = true; }
       else if (arg == "--grid") { gridText = next("--grid"); }
-      else if (arg == "--lambda") { next("--lambda"); }
-      else if (arg == "--samples") { next("--samples"); }
+      else if (arg == "--lambda") { defParams.lambda = std::stof(next("--lambda")); }
+      else if (arg == "--samples") { defParams.sampleNum = std::stoi(next("--samples")); }
       else if (arg == "--warped-ext") { warpedExt = next("--warped-ext"); }
       else if (arg == "--write-deformation-field") { writeDeformationField = true; }
       else if (arg == "-v") { params.verbose = true; }
@@ -202,10 +205,22 @@ main(int argc, char * argv[])
     std::cerr << "error: at least one stage is required\n";
     return EXIT_FAILURE;
   }
-  if (wantDeformable || writeDeformationField || !gridText.empty())
+  if (!gridText.empty())
   {
-    std::cerr << "error: the deformable (discrete MRF) stage is not implemented in this build.\n"
-              << "       This is the linear milestone: use --stages rigid,affine.\n";
+    // A full schedule is accepted, but the algorithm derives it by halving: take the
+    // coarsest spacing and the number of entries as the level count.
+    const std::vector<std::string> grid = Split(gridText, ',');
+    if (grid.empty())
+    {
+      std::cerr << "error: --grid needs at least one spacing" << std::endl;
+      return EXIT_FAILURE;
+    }
+    defParams.gridStart = std::stoi(grid[0]);
+    defParams.numLevels = static_cast<int>(grid.size());
+  }
+  if (writeDeformationField && !wantDeformable)
+  {
+    std::cerr << "error: --write-deformation-field needs the deformable stage" << std::endl;
     return EXIT_FAILURE;
   }
 
@@ -301,15 +316,22 @@ main(int argc, char * argv[])
 
     // The affine already contains the rigid when both ran, so the final linear
     // transform is whichever stage ran last.
+    // Deformable-only runs have no linear transform: resample through identity and
+    // do not write a transform file that would claim otherwise.
+    const bool haveLinear = (rigid.IsNotNull() || affine.IsNotNull());
     itk::Transform<double, stpt::Dimension, stpt::Dimension>::Pointer finalTransform;
     if (affine) { finalTransform = affine.GetPointer(); }
-    else { finalTransform = rigid.GetPointer(); }
+    else if (rigid) { finalTransform = rigid.GetPointer(); }
+    else { finalTransform = itk::IdentityTransform<double, stpt::Dimension>::New().GetPointer(); }
 
     const std::string transformPath = outDir + "/stpt_Affine.txt";
-    auto              transformWriter = itk::TransformFileWriterTemplate<double>::New();
-    transformWriter->SetFileName(transformPath);
-    transformWriter->SetInput(finalTransform);
-    transformWriter->Update();
+    if (haveLinear)
+    {
+      auto transformWriter = itk::TransformFileWriterTemplate<double>::New();
+      transformWriter->SetFileName(transformPath);
+      transformWriter->SetInput(finalTransform);
+      transformWriter->Update();
+    }
 
     using ResampleType = itk::ResampleImageFilter<stpt::ImageType, stpt::ImageType>;
     auto resample = ResampleType::New();
@@ -320,14 +342,83 @@ main(int argc, char * argv[])
     resample->SetDefaultPixelValue(0);
     resample->Update();
 
+    // --- deformable: discrete symmetric MRF on the linearly-aligned pair ----------
+    stpt::ImageType::Pointer linearWarped = resample->GetOutput();
+    stpt::ImageType::Pointer finalWarped = linearWarped;
+    stpt::DeformableResult   deformable;
+    bool                     ranDeformable = false;
+
+    if (wantDeformable)
+    {
+      defParams.verbose = params.verbose;
+      if (params.verbose) { std::cout << "stage: deformable (discrete MRF)" << std::endl; }
+
+      const auto size = fixed->GetBufferedRegion().GetSize();
+      deformable = stpt::RunDeformableRegistration(fixed->GetBufferPointer(),
+                                                   linearWarped->GetBufferPointer(),
+                                                   static_cast<int>(size[0]),
+                                                   static_cast<int>(size[1]),
+                                                   static_cast<int>(size[2]),
+                                                   defParams);
+      ranDeformable = true;
+
+      // The algorithm already resampled the moving image; copy that out rather than
+      // re-warping, so the written image is exactly what the metric was computed on.
+      auto warpedImage = stpt::ImageType::New();
+      warpedImage->CopyInformation(fixed);
+      warpedImage->SetRegions(fixed->GetBufferedRegion());
+      warpedImage->Allocate();
+      std::copy(deformable.warped.begin(), deformable.warped.end(), warpedImage->GetBufferPointer());
+      finalWarped = warpedImage;
+
+      if (writeDeformationField)
+      {
+        using VectorType = itk::Vector<float, stpt::Dimension>;
+        using FieldType = itk::Image<VectorType, stpt::Dimension>;
+        auto field = FieldType::New();
+        field->CopyInformation(fixed);
+        field->SetRegions(fixed->GetBufferedRegion());
+        field->Allocate();
+
+        // Voxel displacements -> physical, honouring spacing and direction cosines.
+        const auto   spacing = fixed->GetSpacing();
+        const auto   direction = fixed->GetDirection();
+        VectorType * out = field->GetBufferPointer();
+        for (size_t i = 0; i < deformable.dispX.size(); ++i)
+        {
+          const double local[stpt::Dimension] = { deformable.dispX[i] * spacing[0],
+                                                  deformable.dispY[i] * spacing[1],
+                                                  deformable.dispZ[i] * spacing[2] };
+          VectorType   v;
+          for (unsigned int r = 0; r < stpt::Dimension; ++r)
+          {
+            double acc = 0.0;
+            for (unsigned int c = 0; c < stpt::Dimension; ++c)
+            {
+              acc += direction[r][c] * local[c];
+            }
+            v[r] = static_cast<float>(acc);
+          }
+          out[i] = v;
+        }
+
+        const std::string fieldPath = outDir + "/stpt_Warp.nii.gz";
+        auto              fieldWriter = itk::ImageFileWriter<FieldType>::New();
+        fieldWriter->SetFileName(fieldPath);
+        fieldWriter->SetInput(field);
+        fieldWriter->Update();
+        if (params.verbose) { std::cout << "wrote " << fieldPath << std::endl; }
+      }
+    }
+
     const std::string warpedPath = outDir + "/stpt_Warped" + warpedExt;
     auto              writer = itk::ImageFileWriter<stpt::ImageType>::New();
     writer->SetFileName(warpedPath);
-    writer->SetInput(resample->GetOutput());
+    writer->SetInput(finalWarped);
     writer->Update();
 
     std::ofstream log(outDir + "/stpt.log");
-    log << "gridpoint (linear milestone)\n"
+    log << "gridpoint\n"
         << "fixed: " << fixedPath << "\n"
         << "moving: " << movingPath << "\n"
         << "stages: " << stagesText << "\n"
@@ -338,6 +429,14 @@ main(int argc, char * argv[])
         << "transform: " << transformPath << "\n"
         << "warped: " << warpedPath << "\n"
         << "final parameters: " << finalTransform->GetParameters() << "\n";
+    if (ranDeformable)
+    {
+      log << "deformable levels: " << deformable.levelsUsed << "\n"
+          << "deformable grid start: " << deformable.gridStartUsed << "\n"
+          << "deformable lambda: " << defParams.lambda << "\n"
+          << "mean squared difference: " << deformable.metricBefore << " -> "
+          << deformable.metricAfter << "\n";
+    }
     log.close();
 
     if (params.verbose)

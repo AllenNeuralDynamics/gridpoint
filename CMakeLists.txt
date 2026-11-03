@@ -33,6 +33,7 @@ include(${ITK_USE_FILE})
 add_executable(gridpoint
   src/gridpoint.cxx
   src/StptLinearRegistration.cxx
+  src/StptDeformableMRF.cxx
 )
 target_include_directories(gridpoint PRIVATE src)
 target_link_libraries(gridpoint PRIVATE ${ITK_LIBRARIES})
