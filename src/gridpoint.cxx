@@ -14,11 +14,16 @@
 #include "StptLinearRegistration.h"
 
 #include "itkIdentityTransform.h"
+#include "itkImage.h"
+#include "itkMultiThreaderBase.h"
+#include "itkVector.h"
 #include "itkImageFileReader.h"
 #include "itkImageFileWriter.h"
 #include "itkLinearInterpolateImageFunction.h"
 #include "itkResampleImageFilter.h"
 #include "itkTransformFileWriter.h"
+
+#include <itksys/SystemTools.hxx>
 
 #include <algorithm>
 #include <fstream>
