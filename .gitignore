@@ -1,0 +1,8 @@
+build/
+*.user
+.vs/
+CMakeCache.txt
+CMakeFiles/
+Testing/
+*.vcxproj*
+*.sln
