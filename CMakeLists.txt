@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
-project(gridpoint CXX)
+project(gridpoint LANGUAGES C CXX)
+# C is enabled only because ITK's HDF5 module reaches FindHDF5, which probes the
+# toolchain by compiling a .c file. A CXX-only project fails that probe outright.
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
