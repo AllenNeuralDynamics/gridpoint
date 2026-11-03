@@ -29,22 +29,60 @@ forward and backward each level and composed, giving a symmetric field.
 
 ## Build
 
-Needs ITK 5 (any build with the default modules) and a C++17 compiler.
+ITK 5 and a C++17 compiler. That is the whole dependency list — no Kakadu/JPEG2000,
+TinyXML, Boost or VTK, which the original code required.
+
+### Linux (easiest: ITK from apt)
+
+Ubuntu 22.04 and 24.04 package ITK 5 directly. Earlier releases ship ITK 4 and will not
+work.
 
 ```bash
-cmake -S . -B build -DITK_DIR=/path/to/ITK-build
-cmake --build build --config Release
+sudo apt-get install -y build-essential cmake libinsighttoolkit5-dev
 ```
 
-On Windows with Visual Studio:
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$(nproc)"
+```
+
+No `ITK_DIR` is needed when ITK is installed system-wide. The binary lands at
+`build/gridpoint`; `sudo cmake --install build` puts it in `/usr/local/bin`.
+
+### From your own ITK build tree
+
+Point `ITK_DIR` at the directory containing `ITKConfig.cmake`:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DITK_DIR=/path/to/ITK-build
+```
+
+### Windows (Visual Studio)
 
 ```bash
 cmake -S . -B build -G "Visual Studio 16 2019" -A x64 -DITK_DIR=C:/path/to/ITK-build
+```
+
+```bash
 cmake --build build --config Release
 ```
 
-Only the ITK modules actually used are requested, so an ITK build missing optional image
-format backends (JPEG2000 and friends) still works.
+### Verify
+
+```bash
+./build/gridpoint --help
+```
+
+### Notes and troubleshooting
+
+- Only the ITK modules actually used are requested, so an ITK build missing optional
+  image-format backends (JPEG2000 and friends) still links.
+- The project enables both C and C++ even though no C source exists here. ITK's HDF5
+  module reaches CMake's `FindHDF5`, which validates the toolchain by compiling a `.c`
+  probe; a C++-only project fails that probe with *"Unknown extension .c"*.
+- Configuring against Ubuntu's ITK prints a wall of warnings about missing `vtkgdcm*`
+  and `gdcm*` files. That is a known defect in the `libgdcm` package, whose
+  `GDCMTargets.cmake` references files the binary package does not install. It is noise;
+  the build succeeds.
 
 ## Usage
 
