@@ -75,7 +75,22 @@ Outputs, written into `out_dir`:
 |---|---|
 | `stpt_Affine.txt` | collapsed rigid+affine transform (ITK format, maps fixed → moving) |
 | `stpt_Warped<ext>` | moving image resampled onto the fixed grid |
+| `stpt_Warp.nii.gz` | dense deformation field — **only with `--write-deformation-field`** |
 | `stpt.log` | settings and final parameters |
+
+The deformation field is a 3-component float vector image on the fixed grid, in physical
+units (voxel displacements are converted using the fixed image's spacing and direction
+cosines). That makes it an ordinary ITK displacement field, so ANTs can consume it:
+
+```
+antsApplyTransforms -d 3 -i moving.nii.gz -r fixed.nii.gz -o redone.nii.gz \
+    -t out_dir/stpt_Warp.nii.gz -t out_dir/stpt_Affine.txt
+```
+
+Order matters — `antsApplyTransforms` applies `-t` right to left, so the affine must be
+listed *last*. Verified on a 96³ textured pair: that ordering reproduces gridpoint's own
+`stpt_Warped.nii.gz` to NCC 0.9990 (the residual is interpolation, not convention),
+while the reverse order gives 0.8992.
 
 ## Validation
 
