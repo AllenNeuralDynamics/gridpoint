@@ -1,4 +1,4 @@
-# stpt_register
+# gridpoint
 
 Register **two arbitrary 3D volumes** with the Allen STPT/CCF registration algorithm —
 the method used to build the Allen Mouse Common Coordinate Framework average template.
@@ -47,10 +47,10 @@ format backends (JPEG2000 and friends) still works.
 ## Usage
 
 ```
-stpt_register -f fixed.nii.gz -m moving.nii.gz -o out_dir [options]
+gridpoint -f fixed.nii.gz -m moving.nii.gz -o out_dir [options]
 ```
 
-Run `stpt_register --help` for the full list. Common options:
+Run `gridpoint --help` for the full list. Common options:
 
 | Option | Meaning |
 |---|---|
@@ -97,5 +97,5 @@ result = reg.run()
 warped = result.load("warped")     # -> SimpleITK.Image
 ```
 
-Put `stpt_register` on `PATH` or set `STPTPATH` to its directory. commandants only
+Put `gridpoint` on `PATH` or set `STPTPATH` to its directory. commandants only
 invokes the binary, so that MIT-licensed package stays independent of this one's license.

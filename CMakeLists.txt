@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(stpt_register CXX)
+project(gridpoint CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,11 +30,11 @@ find_package(ITK REQUIRED COMPONENTS
 )
 include(${ITK_USE_FILE})
 
-add_executable(stpt_register
-  src/stpt_register.cxx
+add_executable(gridpoint
+  src/gridpoint.cxx
   src/StptLinearRegistration.cxx
 )
-target_include_directories(stpt_register PRIVATE src)
-target_link_libraries(stpt_register PRIVATE ${ITK_LIBRARIES})
+target_include_directories(gridpoint PRIVATE src)
+target_link_libraries(gridpoint PRIVATE ${ITK_LIBRARIES})
 
-install(TARGETS stpt_register RUNTIME DESTINATION bin)
+install(TARGETS gridpoint RUNTIME DESTINATION bin)

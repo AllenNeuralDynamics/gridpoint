@@ -13,7 +13,7 @@ use for commercial purposes require the Allen Institute's written permission**
 | File here | Derived from (upstream, under `lims2_modules/common/register/`) |
 |---|---|
 | `src/StptLinearRegistration.{h,cxx}` | `Registration/idpMutualInfoVersorRigidVolumeRegistration.{h,txx}`, `Registration/idpMutualInfoCenteredAffineRegularGradientDescentRegistration.{h,txx}` |
-| `src/stpt_register.cxx` | New. Replaces the `idpProjection*Module` entry points with a two-volume CLI. |
+| `src/gridpoint.cxx` | New. Replaces the `idpProjection*Module` entry points with a two-volume CLI. |
 
 ## What changed, and why
 

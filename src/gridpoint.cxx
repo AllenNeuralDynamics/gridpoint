@@ -1,6 +1,6 @@
 /*=========================================================================
  *
- *  stpt_register.cxx -- register two 3D volumes with the Allen STPT/CCF algorithm.
+ *  gridpoint.cxx -- register two 3D volumes with the Allen STPT/CCF algorithm.
  *
  *  Derived from AllenInstitute/stpt_registration.
  *  Copyright (c) Allen Institute for Brain Science. All rights reserved.
@@ -327,7 +327,7 @@ main(int argc, char * argv[])
     writer->Update();
 
     std::ofstream log(outDir + "/stpt.log");
-    log << "stpt_register (linear milestone)\n"
+    log << "gridpoint (linear milestone)\n"
         << "fixed: " << fixedPath << "\n"
         << "moving: " << movingPath << "\n"
         << "stages: " << stagesText << "\n"
