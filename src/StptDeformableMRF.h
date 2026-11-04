@@ -44,9 +44,18 @@ struct DeformableResult
 {
   std::vector<float> warped;  // moving image resampled into fixed space
   // Forward displacement field in VOXELS, already mapped to x-fastest axis order.
+  // Maps fixed positions to moving positions: use it to pull moving into fixed space.
   std::vector<float> dispX;
   std::vector<float> dispY;
   std::vector<float> dispZ;
+  // Backward displacement field, same units and axis order. The symmetric optimization
+  // produces this alongside the forward one -- it is the other half of the composed
+  // path, not a numerical inversion -- and it maps moving positions back to fixed ones.
+  // Both fields live on the fixed grid, because the deformable stage runs on the pair
+  // after linear alignment has already resampled moving onto that grid.
+  std::vector<float> invX;
+  std::vector<float> invY;
+  std::vector<float> invZ;
   float              metricBefore{ 0.0f };  // mean squared difference before
   float              metricAfter{ 0.0f };   // ... and after
   int                levelsUsed{ 0 };

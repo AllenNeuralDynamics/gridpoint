@@ -66,12 +66,14 @@ PrintUsage(const char * argv0)
     << "  --lambda <x>                 deformable smoothness weight\n"
     << "  --samples <n>                deformable random samples\n"
     << "  --warped-ext <.ext>          warped image extension (default .nii.gz)\n"
-    << "  --write-deformation-field    also write the dense deformation field\n"
+    << "  --write-deformation-field    also write the dense deformation fields\n"
     << "  -v                           verbose\n\n"
     << "Outputs, written into <out_dir>:\n"
     << "  stpt_Affine.txt              collapsed rigid+affine transform (ITK, maps fixed->moving)\n"
     << "  stpt_Warped<ext>             moving image resampled onto the fixed grid\n"
-    << "  stpt_Warp.nii.gz             deformation field (with --write-deformation-field)\n"
+    << "  stpt_Warp.nii.gz             forward deformation field, fixed->moving\n"
+    << "  stpt_InverseWarp.nii.gz      backward deformation field, moving->fixed\n"
+    << "                               (both need --write-deformation-field)\n"
     << "  stpt.log                     settings and outcome\n";
 }
 
@@ -380,39 +382,53 @@ main(int argc, char * argv[])
       {
         using VectorType = itk::Vector<float, stpt::Dimension>;
         using FieldType = itk::Image<VectorType, stpt::Dimension>;
-        auto field = FieldType::New();
-        field->CopyInformation(fixed);
-        field->SetRegions(fixed->GetBufferedRegion());
-        field->Allocate();
 
-        // Voxel displacements -> physical, honouring spacing and direction cosines.
-        const auto   spacing = fixed->GetSpacing();
-        const auto   direction = fixed->GetDirection();
-        VectorType * out = field->GetBufferPointer();
-        for (size_t i = 0; i < deformable.dispX.size(); ++i)
-        {
-          const double local[stpt::Dimension] = { deformable.dispX[i] * spacing[0],
-                                                  deformable.dispY[i] * spacing[1],
-                                                  deformable.dispZ[i] * spacing[2] };
-          VectorType   v;
-          for (unsigned int r = 0; r < stpt::Dimension; ++r)
+        // Both fields go through this one helper so their conventions cannot drift
+        // apart: voxel displacements -> physical, honouring spacing and direction
+        // cosines, on the fixed grid.
+        auto writeField = [&](const std::vector<float> & compX,
+                              const std::vector<float> & compY,
+                              const std::vector<float> & compZ,
+                              const std::string &        path) {
+          auto field = FieldType::New();
+          field->CopyInformation(fixed);
+          field->SetRegions(fixed->GetBufferedRegion());
+          field->Allocate();
+
+          const auto   spacing = fixed->GetSpacing();
+          const auto   direction = fixed->GetDirection();
+          VectorType * out = field->GetBufferPointer();
+          for (size_t i = 0; i < compX.size(); ++i)
           {
-            double acc = 0.0;
-            for (unsigned int c = 0; c < stpt::Dimension; ++c)
+            const double local[stpt::Dimension] = { compX[i] * spacing[0],
+                                                    compY[i] * spacing[1],
+                                                    compZ[i] * spacing[2] };
+            VectorType   v;
+            for (unsigned int r = 0; r < stpt::Dimension; ++r)
             {
-              acc += direction[r][c] * local[c];
+              double acc = 0.0;
+              for (unsigned int c = 0; c < stpt::Dimension; ++c)
+              {
+                acc += direction[r][c] * local[c];
+              }
+              v[r] = static_cast<float>(acc);
             }
-            v[r] = static_cast<float>(acc);
+            out[i] = v;
           }
-          out[i] = v;
-        }
 
-        const std::string fieldPath = outDir + "/stpt_Warp.nii.gz";
-        auto              fieldWriter = itk::ImageFileWriter<FieldType>::New();
-        fieldWriter->SetFileName(fieldPath);
-        fieldWriter->SetInput(field);
-        fieldWriter->Update();
-        if (params.verbose) { std::cout << "wrote " << fieldPath << std::endl; }
+          auto fieldWriter = itk::ImageFileWriter<FieldType>::New();
+          fieldWriter->SetFileName(path);
+          fieldWriter->SetInput(field);
+          fieldWriter->Update();
+          if (params.verbose) { std::cout << "wrote " << path << std::endl; }
+        };
+
+        writeField(deformable.dispX, deformable.dispY, deformable.dispZ,
+                   outDir + "/stpt_Warp.nii.gz");
+        // The backward half of the symmetric optimization, for mapping fixed-space data
+        // (atlas labels, point sets) back onto the moving image.
+        writeField(deformable.invX, deformable.invY, deformable.invZ,
+                   outDir + "/stpt_InverseWarp.nii.gz");
       }
     }
 

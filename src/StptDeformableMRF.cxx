@@ -1116,6 +1116,11 @@ RunDeformableRegistration(const float *                imgFixIn,
   result.dispX.swap(yfld);
   result.dispY.swap(xfld);
   result.dispZ.swap(zfld);
+  // Same component transposition for the backward field -- it comes off the identical
+  // interpolate3d convention, so it must get the identical swap or it exports transposed.
+  result.invX.swap(yfldinv);
+  result.invY.swap(xfldinv);
+  result.invZ.swap(zfldinv);
   result.metricBefore = ctx.metricBefore;
   result.metricAfter = ctx.metricAfter;
   result.levelsUsed = numLevels;

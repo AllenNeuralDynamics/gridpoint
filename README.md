@@ -113,12 +113,13 @@ Outputs, written into `out_dir`:
 |---|---|
 | `stpt_Affine.txt` | collapsed rigid+affine transform (ITK format, maps fixed → moving) |
 | `stpt_Warped<ext>` | moving image resampled onto the fixed grid |
-| `stpt_Warp.nii.gz` | dense deformation field — **only with `--write-deformation-field`** |
+| `stpt_Warp.nii.gz` | forward deformation field, fixed → moving — **only with `--write-deformation-field`** |
+| `stpt_InverseWarp.nii.gz` | backward field, moving → fixed — same flag |
 | `stpt.log` | settings and final parameters |
 
-The deformation field is a 3-component float vector image on the fixed grid, in physical
+Each deformation field is a 3-component float vector image on the fixed grid, in physical
 units (voxel displacements are converted using the fixed image's spacing and direction
-cosines). That makes it an ordinary ITK displacement field, so ANTs can consume it:
+cosines). That makes them ordinary ITK displacement fields, so ANTs can consume them:
 
 ```
 antsApplyTransforms -d 3 -i moving.nii.gz -r fixed.nii.gz -o redone.nii.gz \
@@ -129,6 +130,42 @@ Order matters — `antsApplyTransforms` applies `-t` right to left, so the affin
 listed *last*. Verified on a 96³ textured pair: that ordering reproduces gridpoint's own
 `stpt_Warped.nii.gz` to NCC 0.9990 (the residual is interpolation, not convention),
 while the reverse order gives 0.8992.
+
+### Going the other way
+
+The deformable stage is symmetric: it optimizes forward and backward at every level and
+composes them, so the backward field is produced alongside the forward one rather than
+recovered by inverting it afterwards. That is what `stpt_InverseWarp.nii.gz` holds, and
+it is what you need to carry fixed-space data — atlas labels, annotations, point sets —
+onto the moving image:
+
+```
+antsApplyTransforms -d 3 -i ccf_annotation.nii.gz -r moving.nii.gz -o labels_in_moving.nii.gz \
+    -n NearestNeighbor -t [out_dir/stpt_Affine.txt,1] -t out_dir/stpt_InverseWarp.nii.gz
+```
+
+Note the order is the mirror of the forward recipe — the inverted affine comes *first* on
+the command line now — and that `,1` is what inverts it.
+
+Both fields are written on the fixed grid, because the deformable stage runs after linear
+alignment has already resampled the moving image onto that grid. ANTs interpolates a
+displacement field wherever it needs it, so using the inverse field with `-r moving.nii.gz`
+works; it simply has nothing to say outside the fixed image's bounding box.
+
+Measured on the same 96³ pair, composing the two fields returns points to where they
+started — median residual **0.006 voxels**, p95 **0.26**, against forward displacements
+averaging 1.76 voxels (p95 4.82). End to end, mapping fixed into moving space:
+
+| Transform chain | NCC vs. the real moving image |
+|---|---|
+| `[Affine,1]` then `InverseWarp` | **0.8931** |
+| `InverseWarp` then `[Affine,1]` (wrong order) | 0.8225 |
+| `[Affine,1]` alone | 0.8197 |
+| `[Affine,1]` with the *forward* field | 0.7416 |
+
+The inverse direction scores about what the forward direction does (0.8889), which is the
+symmetry showing up where it should. Both wrong variants land at or below the affine-only
+baseline, so a convention mistake here is loud rather than subtle.
 
 ## Validation
 
