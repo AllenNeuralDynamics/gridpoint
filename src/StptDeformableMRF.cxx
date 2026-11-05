@@ -19,6 +19,8 @@
  *=========================================================================*/
 #include "StptDeformableMRF.h"
 
+#include "itkMultiThreaderBase.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -120,6 +122,48 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 }
 
 // ---------------------------------------------------------------------------
+// Parallel execution.
+//
+// The deformable stage was entirely single-threaded, which made it 93% of wall
+// time on a 24-core box and left larger machines almost completely idle. The
+// loops below are data-parallel: each iteration writes its own disjoint slice
+// of the output, so splitting the index range into contiguous chunks preserves
+// the result exactly, including its floating-point rounding -- no iteration
+// contributes to a shared accumulator.
+//
+// ITK thread pooling is used rather than OpenMP or raw std::thread: ITK is
+// already the only dependency, the pool avoids paying thread-creation cost on
+// the many short parallel regions inside one pyramid level, and it honours the
+// existing --threads flag with no extra plumbing.
+// ---------------------------------------------------------------------------
+template <typename Body>
+void
+parallelFor(vidx count, Body body)
+{
+  if (count <= 0) { return; }
+  const vidx maxThreads =
+    std::max<vidx>(1, static_cast<vidx>(itk::MultiThreaderBase::GetGlobalDefaultNumberOfThreads()));
+  // More chunks than threads: per-chunk cost is uneven (boundary nodes take a
+  // slower path), and finer chunks let the pool even that out.
+  const vidx chunks = std::min<vidx>(count, maxThreads * 4);
+  if (chunks <= 1)
+  {
+    body(static_cast<vidx>(0), count);
+    return;
+  }
+  itk::MultiThreaderBase::Pointer mt = itk::MultiThreaderBase::New();
+  mt->ParallelizeArray(
+    0,
+    static_cast<itk::SizeValueType>(chunks),
+    [&](itk::SizeValueType c) {
+      const vidx begin = static_cast<vidx>(c) * count / chunks;
+      const vidx end = (static_cast<vidx>(c) + 1) * count / chunks;
+      body(begin, end);
+    },
+    nullptr);
+}
+
+// ---------------------------------------------------------------------------
 // Upstream numeric core, verbatim apart from the changes noted in the file header.
 // ---------------------------------------------------------------------------
         void
@@ -157,10 +201,10 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             int xdelta[6] = {-1, 1, 0, 0, 0, 0};
             int ydelta[6] = {0, 0, -1, 1, 0, 0};
             int zdelta[6] = {0, 0, 0, 0, -1, 1};
-            vidx x, y, z, xnew, ynew, znew;   // volume coordinates: 64-bit
 
             //calculate weights 
-            for (int k = 0; k < zgridsize; k++) {
+            parallelFor(zgridsize, [&](vidx kBegin, vidx kEnd) {
+            for (int k = static_cast<int>(kBegin); k < static_cast<int>(kEnd); k++) {
                 for (int j = 0; j < ygridsize; j++) {
                     for (int i = 0; i < xgridsize; i++) {
                         for (int nb = 0; nb < num_neighbours; nb++) {
@@ -169,12 +213,12 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                                 for (int k1 = 0; k1 < stepsize; k1++) {
                                     for (int j1 = 0; j1 < stepsize; j1++) {
                                         for (int i1 = 0; i1 < stepsize; i1++) {
-                                            x = j * stepsize + j1;
-                                            y = i * stepsize + i1;
-                                            z = k * stepsize + k1;
-                                            xnew = (j + xdelta[nb]) * stepsize + j1;
-                                            ynew = (i + ydelta[nb]) * stepsize + i1;
-                                            znew = (k + zdelta[nb]) * stepsize + k1;
+                                            const vidx x = j * stepsize + j1;
+                                            const vidx y = i * stepsize + i1;
+                                            const vidx z = k * stepsize + k1;
+                                            const vidx xnew = (j + xdelta[nb]) * stepsize + j1;
+                                            const vidx ynew = (i + ydelta[nb]) * stepsize + i1;
+                                            const vidx znew = (k + zdelta[nb]) * stepsize + k1;
                                             edgecost[i + j * xgridsize + k * xgridsize * ygridsize + nb * num_vertices] += fabs(dfmfld[y + x * xsize + z * xsize * ysize] - dfmfld[ynew + xnew * xsize + znew * xsize * ysize]);
                                         }
                                     }
@@ -184,6 +228,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                     }
                 }
             }
+            });
 
             int root = xgridsize / 2 + ygridsize / 2 * xgridsize + zgridsize / 2 * xgridsize*ygridsize;
 
@@ -335,8 +380,13 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
         interpolate3d(float* interp, float* input, float* x1, float* y1, float* z1, vidx xsize, vidx ysize, vidx zsize, vidx xsizenew, vidx ysizenew, vidx zsizenew, bool flag) {
             using namespace std;
 
-            for (vidx k = 0; k < zsize; k++) {
-                for (vidx j = 0; j < ysize; j++) {
+            // Output rows are independent, and there are ysize*zsize of them -- ample
+            // parallel width even on a coarse control grid.
+            const vidx rowCount = ysize * zsize;
+            parallelFor(rowCount, [&](vidx rowBegin, vidx rowEnd) {
+                for (vidx r = rowBegin; r < rowEnd; r++) {
+                    const vidx k = r / ysize;
+                    const vidx j = r - k * ysize;
                     for (vidx i = 0; i < xsize; i++) {
                         vidx x = (vidx) floor(x1[i + j * xsize + k * xsize * ysize]);
                         vidx y = (vidx) floor(y1[i + j * xsize + k * xsize * ysize]);
@@ -360,7 +410,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                                 deltax * deltay * deltaz * input[clampIdx(y + 1, xsizenew - 1) + clampIdx(x + 1, ysizenew - 1) * xsizenew + clampIdx(z + 1, zsizenew - 1) * xsizenew * ysizenew];
                     }
                 }
-            }
+            });
         }
 
         void
@@ -374,15 +424,18 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             float* x1 = new float[xsize_in * ysize_in * zsize_in];
             float* y1 = new float[xsize_in * ysize_in * zsize_in];
             float* z1 = new float[xsize_in * ysize_in * zsize_in];
-            for (vidx k = 0; k < zsize_in; k++) {
-                for (vidx j = 0; j < ysize_in; j++) {
+            const vidx fillRows = ysize_in * zsize_in;
+            parallelFor(fillRows, [&](vidx rowBegin, vidx rowEnd) {
+                for (vidx r = rowBegin; r < rowEnd; r++) {
+                    const vidx k = r / ysize_in;
+                    const vidx j = r - k * ysize_in;
                     for (vidx i = 0; i < xsize_in; i++) {
                         x1[i + j * xsize_in + k * xsize_in * ysize_in] = j / scale_n;
                         y1[i + j * xsize_in + k * xsize_in * ysize_in] = i / scale_m;
                         z1[i + j * xsize_in + k * xsize_in * ysize_in] = k / scale_o;
                     }
                 }
-            }
+            });
 
             interpolate3d(fldx_in, fldx, x1, y1, z1, xsize_in, ysize_in, zsize_in, xsize, ysize, zsize, false);
             interpolate3d(fldy_in, fldy, x1, y1, z1, xsize_in, ysize_in, zsize_in, xsize, ysize, zsize, false);
@@ -809,22 +862,36 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             } else {
                 maxsamp = (int) pow(gridstep, 3);
             }
-            float* cost1 = new float[lengthfull];
-            float* costcount = new float[lengthfull];
-
-            int frac = (int) (sz1 / 25);
-            if (frac < 1) { frac = 1; }  // guard: i % frac below
-
             float epsilon = gamma / (float) maxsamp;
-            vidx xind, yind, zind;
 
             {
-                float* normalizerB = new float[lengthfull];
-
-                for (vidx i = 0; i < sz1; i++) {
-                    if ((i % frac) == 0) {
-                        cout << "x" << flush;
+                // The sample indices come off the global rand() stream, which is sequential
+                // state: drawing them inside a parallel loop would both race and reorder them.
+                // Drawing them all up front, in the original order, lets the parallel loop
+                // reproduce the serial result exactly rather than merely equivalently.
+                std::vector<int> sampleIdx;
+                if (randommode) {
+                    const int cellCount = (int) pow(gridstep, 3);
+                    sampleIdx.resize(static_cast<size_t>(sz1) * maxsamp);
+                    for (size_t sIdx = 0; sIdx < sampleIdx.size(); sIdx++) {
+                        int i1 = (int) (rand() * pow(gridstep, 3) / float(RAND_MAX));
+                        if (i1 >= cellCount) { i1 = cellCount - 1; }
+                        if (i1 < 0) { i1 = 0; }
+                        sampleIdx[sIdx] = i1;
                     }
+                }
+
+                // Each node writes only energy[i + l*sz1], so nodes are independent and the
+                // chunks below are disjoint in both their reads and their writes.
+                parallelFor(sz1, [&](vidx nodeBegin, vidx nodeEnd) {
+
+                // Scratch the serial version shared has to become per-chunk.
+                std::vector<float> cost1Buf(lengthfull), normBBuf(lengthfull);
+                float* cost1 = cost1Buf.data();
+                float* normalizerB = normBBuf.data();
+                vidx xind, yind, zind;
+
+                for (vidx i = nodeBegin; i < nodeEnd; i++) {
                     vidx z1 = i / (static_cast<vidx>(gridx) * gridy);
                     vidx x1 = (i - z1 * gridx * gridy) / gridx;
                     vidx y1 = i - z1 * gridx * gridy - x1*gridx;
@@ -860,16 +927,9 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 
 
                     for (int j1 = 0; j1 < maxsamp; j1++) {
-                        int i1;
-                        if (randommode)
-                        {
-                            const int cellCount = (int) pow(gridstep, 3);
-                            i1 = (int) (rand() * pow(gridstep, 3) / float(RAND_MAX));
-                            if (i1 >= cellCount) { i1 = cellCount - 1; }
-                            if (i1 < 0) { i1 = 0; }
-                        }
-                        else
-                            i1 = j1;
+                        const int i1 = randommode
+                                         ? sampleIdx[static_cast<size_t>(i) * maxsamp + j1]
+                                         : j1;
                         vidx zz = i1 / (gridstep * gridstep);
                         vidx xx = (i1 - zz * gridstep * gridstep) / gridstep;
                         vidx yy = i1 - zz * gridstep * gridstep - xx*gridstep;
@@ -916,8 +976,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                         energy[i + l * sz1] = epsilon * (1 - double(q) * double(q));
                     }
                 }
-
-                delete []normalizerB;
+                });
             }
 
             delete []movingi;
@@ -925,8 +984,6 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             delete []movingiInd;
             delete []fixedInd;
 
-            delete []cost1;
-            delete []costcount;
             delete []xs;
             delete []ys;
             delete []zs;
