@@ -664,8 +664,11 @@ parallelFor(vidx count, Body body)
                 int xlast = (last - zlast * gridsizex * gridsizey) / gridsizex;
                 int ylast = last - zlast * gridsizex * gridsizey - xlast*gridsizex;
 
+                // Contiguous: one node's labels now sit next to each other.
+                const vidx nextBase = static_cast<vidx>(next) * searchvol;
+                const vidx lastBase = static_cast<vidx>(last) * searchvol;
                 for (vidx l = 0; l < searchvol; l++) {
-                    energy[l] = costMatrix[next + l * gridsizevol];
+                    energy[l] = costMatrix[nextBase + l];
                 }
 
                 float deltax = (fldx0[ylast + xlast * gridsizex + zlast * gridsizex * gridsizey] - fldx0[ynext + xnext * gridsizex + znext * gridsizex * gridsizey]) / (float) gridmin;
@@ -675,11 +678,11 @@ parallelFor(vidx count, Body body)
                 regulate(energy, index, searchsize, deltax, deltay, deltaz);
 
                 for (vidx l = 0; l < searchvol; l++) {
-                    indexall[ynext + xnext * gridsizex + znext * gridsizex * gridsizey + l * gridsizevol] = index[l];
+                    indexall[nextBase + l] = index[l];
                 }
 
                 for (vidx l = 0; l < searchvol; l++) {
-                    costMatrix[last + l * gridsizevol] += energy[l];
+                    costMatrix[lastBase + l] += energy[l];
                 }
 
             }
@@ -690,14 +693,15 @@ parallelFor(vidx count, Body body)
             int z1 = oroot / (gridsizex * gridsizey);
             int x1 = (oroot - z1 * gridsizex * gridsizey) / gridsizex;
             int y1 = oroot - z1 * gridsizex * gridsizey - x1*gridsizex;
+            const vidx orootBase = static_cast<vidx>(oroot) * searchvol;
             for (vidx l = 0; l < searchvol; l++) {
-                energy[l] = costMatrix[oroot + l * gridsizevol];
+                energy[l] = costMatrix[orootBase + l];
             }
             float value;
             int ind;
             minimumInd(energy, value, ind, searchvol);
             for (vidx l = 0; l < searchvol; l++) {
-                indexall[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey + l * gridsizevol] = l;
+                indexall[orootBase + l] = l;
             }
             labels[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey] = ind;
             fldx[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey] = xs[ind] + fldx0[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey];
@@ -716,7 +720,8 @@ parallelFor(vidx count, Body body)
                 int x2 = (last - z2 * gridsizex * gridsizey) / gridsizex;
                 int y2 = last - z2 * gridsizex * gridsizey - x2*gridsizex;
 
-                ind = indexall[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey + labels[y2 + x2 * gridsizex + z2 * gridsizex * gridsizey] * gridsizex * gridsizey * gridsizez];
+                ind = indexall[static_cast<vidx>(next) * searchvol
+                               + labels[y2 + x2 * gridsizex + z2 * gridsizex * gridsizey]];
                 labels[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey] = ind;
                 fldx[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey] = xs[ind] + fldx0[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey];
                 fldy[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey] = ys[ind] + fldy0[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey];
@@ -969,11 +974,14 @@ parallelFor(vidx count, Body body)
                         }
                     }
 
+                    // Contiguous run of labelCount floats for this node, rather than
+                    // lengthfull writes each one node-count apart.
+                    const vidx energyBase = i * lengthfull;
                     for (int l = 0; l < lengthfull; l++) {
                         // Squaring, not a general pow. The ratio stays in float exactly as
                         // upstream computed it, so the rounding sequence is unchanged.
                         const float q = cost1[l] * cost1[l] / normA / normalizerB[l];
-                        energy[i + l * sz1] = epsilon * (1 - double(q) * double(q));
+                        energy[energyBase + l] = epsilon * (1 - double(q) * double(q));
                     }
                 }
                 });
