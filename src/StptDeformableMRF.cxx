@@ -1012,13 +1012,41 @@ parallelFor(vidx count, Body body)
 
             interpolate3d(warped, imgFix, u1, v1, w1, m, n, o, m, n, o, true);
 
-            for (vidx i = 0; i < m; i++) {
-                for (vidx j = 0; j < n; j++) {
-                    for (vidx k = 0; k < o; k++) {
-                        metric += pow(imgMov[i + j * m + k * m * n] - warped[i + j * m + k * m * n], 2);
-                        metric_start += pow(imgMov[i + j * m + k * m * n] - imgFix[i + j * m + k * m * n], 2);
+            // This reduction was half of "warp fixed/moving" and did not scale at all,
+            // for three separate reasons:
+            //
+            //  - It ran k innermost, striding m*n floats (147 KB at 192^3) every step,
+            //    while the contiguous axis i was the OUTERMOST loop. Walking the buffer
+            //    in address order instead is worth more here than the threading is.
+            //  - It called pow(x, 2) twice per voxel to square a difference.
+            //  - It was serial, inside a step whose other half is parallel.
+            //
+            // The metric is diagnostic: it is reported in the log and carried on the
+            // result, but never fed back into the registration, so its summation order
+            // is free. It is summed in a FIXED number of blocks rather than one block
+            // per thread, so the reported value stays independent of --threads.
+            const vidx total = m * n * o;
+            const vidx blocks = std::max<vidx>(1, std::min<vidx>(256, total));
+            std::vector<float> partMetric(blocks, 0.0f), partStart(blocks, 0.0f);
+            parallelFor(blocks, [&](vidx blockBegin, vidx blockEnd) {
+                for (vidx b = blockBegin; b < blockEnd; b++) {
+                    const vidx begin = b * total / blocks;
+                    const vidx end = (b + 1) * total / blocks;
+                    float sumMetric = 0.0f;
+                    float sumStart = 0.0f;
+                    for (vidx idx = begin; idx < end; idx++) {
+                        const float d1 = imgMov[idx] - warped[idx];
+                        const float d2 = imgMov[idx] - imgFix[idx];
+                        sumMetric += d1 * d1;
+                        sumStart += d2 * d2;
                     }
+                    partMetric[b] = sumMetric;
+                    partStart[b] = sumStart;
                 }
+            });
+            for (vidx b = 0; b < blocks; b++) {
+                metric += partMetric[b];
+                metric_start += partStart[b];
             }
 
             metric /= m * n*o;
