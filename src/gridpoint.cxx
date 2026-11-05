@@ -23,6 +23,7 @@
 #include "itkResampleImageFilter.h"
 #include "itkTransformFileWriter.h"
 
+#include <itksys/SystemInformation.hxx>
 #include <itksys/SystemTools.hxx>
 
 #include <algorithm>
@@ -75,6 +76,24 @@ PrintUsage(const char * argv0)
     << "  stpt_InverseWarp.nii.gz      backward deformation field, moving->fixed\n"
     << "                               (both need --write-deformation-field)\n"
     << "  stpt.log                     settings and outcome\n";
+}
+
+std::string
+HumanBytes(long long bytes)
+{
+  const char * units[] = { "B", "KiB", "MiB", "GiB", "TiB" };
+  double       value = static_cast<double>(bytes);
+  int          unit = 0;
+  while (value >= 1024.0 && unit < 4)
+  {
+    value /= 1024.0;
+    ++unit;
+  }
+  std::ostringstream out;
+  out.setf(std::ios::fixed);
+  out.precision(value < 10.0 ? 2 : 1);
+  out << value << " " << units[unit];
+  return out.str();
 }
 
 std::vector<std::string>
@@ -255,6 +274,46 @@ main(int argc, char * argv[])
     stpt::MaskPair masks;
     masks.fixedMask = ReadMask(fixedMaskPath);
     masks.movingMask = ReadMask(movingMaskPath);
+
+    // Pre-flight the deformable stage's memory before doing any work. The buffers scale
+    // strictly with voxel count, so a job that cannot fit is worth saying so about now
+    // rather than after the linear stages have run.
+    if (wantDeformable)
+    {
+      const auto      fixedSize = fixed->GetBufferedRegion().GetSize();
+      const long long estimate = stpt::EstimateDeformablePeakBytes(static_cast<int>(fixedSize[0]),
+                                                                   static_cast<int>(fixedSize[1]),
+                                                                   static_cast<int>(fixedSize[2]),
+                                                                   defParams);
+      const long long voxels = static_cast<long long>(fixedSize[0]) * fixedSize[1] * fixedSize[2];
+      std::cout << "deformable stage: " << voxels << " voxels (" << fixedSize[0] << "x"
+                << fixedSize[1] << "x" << fixedSize[2] << "), estimated peak "
+                << HumanBytes(estimate) << std::endl;
+
+      itksys::SystemInformation sysInfo;
+      sysInfo.RunMemoryCheck();
+      const long long physical = static_cast<long long>(sysInfo.GetTotalPhysicalMemory()) * 1024 * 1024;
+      if (physical > 0 && estimate > physical)
+      {
+        std::cerr << std::endl;
+        std::cerr << "WARNING: the estimate above exceeds this machine's physical memory ("
+                  << HumanBytes(physical) << ")." << std::endl;
+        std::cerr << "         Expect this run to thrash or to be killed. Memory scales with"
+                  << std::endl;
+        std::cerr << "         voxel count, so halving the resolution costs about 8x less."
+                  << std::endl;
+        std::cerr << "         Register coarse, then apply at full resolution:" << std::endl;
+        std::cerr << "           gridpoint -f fixed_coarse -m moving_coarse -o out "
+                  << "--write-deformation-field" << std::endl;
+        std::cerr << "           antsApplyTransforms -d 3 -i moving_full -r fixed_full" << std::endl;
+        std::cerr << "               -o warped.nii.gz -t out/stpt_Warp.nii.gz -t out/stpt_Affine.txt"
+                  << std::endl;
+        std::cerr << "         Note --grid is in VOXELS, so scale it by the same factor."
+                  << std::endl;
+        std::cerr << "         Proceeding anyway." << std::endl;
+        std::cerr << std::endl;
+      }
+    }
 
     // Scale the optimizer to the image unless the caller asked for the upstream constants.
     // scales[translation] = 1/extent makes a unit step in the scaled parameter space

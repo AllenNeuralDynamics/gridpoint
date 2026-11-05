@@ -74,6 +74,17 @@ These are defects in the original, not consequences of the port:
   image. On glibc (`RAND_MAX` = 2^31-1) that is a 1-in-2-billion event and effectively
   invisible; with the Microsoft CRT (`RAND_MAX` = 32767) it is near-certain across the
   ~65k draws per level, and it access-violated immediately. The index is now clamped.
+- **32-bit index arithmetic overflowed on large volumes.** Upstream types every spatial
+  extent and index as `int`. Two expressions overflow sooner than you would guess: the
+  full-volume gather `dfmfld[y + x*xsize + z*xsize*ysize]`, and the cost-volume stride
+  `costMatrix[node + label*nodeCount]`. The second binds first -- on a CCF 10 um volume
+  at the finest level it reaches about 2.35e9 against an `int` ceiling of 2.147e9, while
+  the volume itself (1.20e9 voxels) is still under. Overflow wraps to a negative index,
+  which does not raise: it reads and writes outside the buffer and corrupts the result
+  silently. Every expression that can reach full-volume or cost-volume scale is now
+  `std::int64_t` (`vidx` in the source); grid vertex ids, histogram bin numbers and label
+  counts stay `int`, being bounded by the control grid and search neighbourhood. Verified
+  behaviour-preserving -- outputs are bit-identical on a 96^3 pair before and after.
 - **A progress divisor could be zero.** `frac = sz1 / 25` is 0 whenever there are fewer
   than 25 grid nodes, and `i % frac` then divides by zero. Guarded at both sites.
 

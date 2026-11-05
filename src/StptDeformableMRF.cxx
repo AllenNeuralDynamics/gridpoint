@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <vector>
@@ -35,12 +36,34 @@ using std::min;
 using std::pop_heap;
 using std::push_heap;
 
+/** Index type for anything that can address a full-resolution volume, or a cost
+ *  volume (control-grid nodes x label space).
+ *
+ *  Upstream used plain ``int`` throughout. That caps a volume at 2^31-1 voxels, but
+ *  the real ceiling is lower and less obvious: the cost volumes are indexed as
+ *  ``node + label * nodeCount``, which for a CCF 10 um volume at the finest level is
+ *  about 2.35e9 -- over the limit while the volume itself (1.20e9 voxels) is still
+ *  under it. Overflow there wraps to a negative index and corrupts silently rather
+ *  than failing, so every expression that can reach either scale is 64-bit. Grid
+ *  vertex ids, histogram bin numbers and label counts stay ``int``: they are bounded
+ *  by the control grid and the search neighbourhood, which are orders of magnitude
+ *  smaller. */
+using vidx = std::int64_t;
+
+/** Clamp an index into [0, hi]. Replaces nested min/max whose literal 0 would not
+ *  deduce against a 64-bit index. */
+inline vidx
+clampIdx(vidx v, vidx hi)
+{
+  return v < 0 ? 0 : (v > hi ? hi : v);
+}
+
 /** What the upstream routines used to read off their enclosing class. */
 struct MrfContext
 {
-  int          sizeX{ 0 };
-  int          sizeY{ 0 };
-  int          sizeZ{ 0 };
+  vidx         sizeX{ 0 };
+  vidx         sizeY{ 0 };
+  vidx         sizeZ{ 0 };
   unsigned int numBin{ 32 };
   int          sampleNum{ 1024 };
   float        maxFixed{ 255.0f };
@@ -100,13 +123,13 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 // Upstream numeric core, verbatim apart from the changes noted in the file header.
 // ---------------------------------------------------------------------------
         void
-        minimumInd(float *numbers, float &value, int &index, int length) {
+        minimumInd(float *numbers, float &value, int &index, vidx length) {
             value = numbers[0];
-            int i;
+            vidx i;
             index = 0;
             for (i = 1; i < length; i++) {
                 if (numbers[i] < value) {
-                    index = i;
+                    index = static_cast<int>(i);
                     value = numbers[i];
                 }
             }
@@ -114,12 +137,12 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 
         void
         DfmfldModulation(MrfContext & ctx, float* dfmfld, int* ordered, int* parents, int stepsize) {
-            int xsize = ctx.sizeX;
-            int ysize = ctx.sizeY;
-            int zsize = ctx.sizeZ;
-            int xgridsize = xsize / stepsize;
-            int ygridsize = ysize / stepsize;
-            int zgridsize = zsize / stepsize;
+            vidx xsize = ctx.sizeX;
+            vidx ysize = ctx.sizeY;
+            vidx zsize = ctx.sizeZ;
+            int xgridsize = static_cast<int>(xsize / stepsize);
+            int ygridsize = static_cast<int>(ysize / stepsize);
+            int zgridsize = static_cast<int>(zsize / stepsize);
 
             int num_vertices = xgridsize * ygridsize*zgridsize;
 
@@ -134,7 +157,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             int xdelta[6] = {-1, 1, 0, 0, 0, 0};
             int ydelta[6] = {0, 0, -1, 1, 0, 0};
             int zdelta[6] = {0, 0, 0, 0, -1, 1};
-            int x, y, z, xnew, ynew, znew;
+            vidx x, y, z, xnew, ynew, znew;   // volume coordinates: 64-bit
 
             //calculate weights 
             for (int k = 0; k < zgridsize; k++) {
@@ -309,15 +332,15 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
         }
 
         void
-        interpolate3d(float* interp, float* input, float* x1, float* y1, float* z1, int xsize, int ysize, int zsize, int xsizenew, int ysizenew, int zsizenew, bool flag) {
+        interpolate3d(float* interp, float* input, float* x1, float* y1, float* z1, vidx xsize, vidx ysize, vidx zsize, vidx xsizenew, vidx ysizenew, vidx zsizenew, bool flag) {
             using namespace std;
 
-            for (int k = 0; k < zsize; k++) {
-                for (int j = 0; j < ysize; j++) {
-                    for (int i = 0; i < xsize; i++) {
-                        int x = (int) floor(x1[i + j * xsize + k * xsize * ysize]);
-                        int y = (int) floor(y1[i + j * xsize + k * xsize * ysize]);
-                        int z = (int) floor(z1[i + j * xsize + k * xsize * ysize]);
+            for (vidx k = 0; k < zsize; k++) {
+                for (vidx j = 0; j < ysize; j++) {
+                    for (vidx i = 0; i < xsize; i++) {
+                        vidx x = (vidx) floor(x1[i + j * xsize + k * xsize * ysize]);
+                        vidx y = (vidx) floor(y1[i + j * xsize + k * xsize * ysize]);
+                        vidx z = (vidx) floor(z1[i + j * xsize + k * xsize * ysize]);
                         float deltax = x1[i + j * xsize + k * xsize * ysize] - x;
                         float deltay = y1[i + j * xsize + k * xsize * ysize] - y;
                         float deltaz = z1[i + j * xsize + k * xsize * ysize] - z;
@@ -327,21 +350,21 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                             y += i;
                             z += k;
                         }
-                        interp[i + j * xsize + k * xsize * ysize] = (1.0 - deltax)*(1.0 - deltay)*(1.0 - deltaz) * input[min(max(y, 0), xsizenew - 1) + min(max(x, 0), ysizenew - 1) * xsizenew + min(max(z, 0), zsizenew - 1) * xsizenew * ysizenew]+
-                                (1.0 - deltax) * deltay * (1.0 - deltaz) * input[min(max(y + 1, 0), xsizenew - 1) + min(max(x, 0), ysizenew - 1) * xsizenew + min(max(z, 0), zsizenew - 1) * xsizenew * ysizenew] +
-                                deltax * (1.0 - deltay)*(1.0 - deltaz) * input[min(max(y, 0), xsizenew - 1) + min(max(x + 1, 0), ysizenew - 1) * xsizenew + min(max(z, 0), zsizenew - 1) * xsizenew * ysizenew]+
-                                (1.0 - deltax)*(1.0 - deltay) * deltaz * input[min(max(y, 0), xsizenew - 1) + min(max(x, 0), ysizenew - 1) * xsizenew + min(max(z + 1, 0), zsizenew - 1) * xsizenew * ysizenew] +
-                                deltax * deltay * (1.0 - deltaz) * input[min(max(y + 1, 0), xsizenew - 1) + min(max(x + 1, 0), ysizenew - 1) * xsizenew + min(max(z, 0), zsizenew - 1) * xsizenew * ysizenew]+
-                                (1.0 - deltax) * deltay * deltaz * input[min(max(y + 1, 0), xsizenew - 1) + min(max(x, 0), ysizenew - 1) * xsizenew + min(max(z + 1, 0), zsizenew - 1) * xsizenew * ysizenew] +
-                                deltax * (1.0 - deltay) * deltaz * input[min(max(y, 0), xsizenew - 1) + min(max(x + 1, 0), ysizenew - 1) * xsizenew + min(max(z + 1, 0), zsizenew - 1) * xsizenew * ysizenew] +
-                                deltax * deltay * deltaz * input[min(max(y + 1, 0), xsizenew - 1) + min(max(x + 1, 0), ysizenew - 1) * xsizenew + min(max(z + 1, 0), zsizenew - 1) * xsizenew * ysizenew];
+                        interp[i + j * xsize + k * xsize * ysize] = (1.0 - deltax)*(1.0 - deltay)*(1.0 - deltaz) * input[clampIdx(y, xsizenew - 1) + clampIdx(x, ysizenew - 1) * xsizenew + clampIdx(z, zsizenew - 1) * xsizenew * ysizenew]+
+                                (1.0 - deltax) * deltay * (1.0 - deltaz) * input[clampIdx(y + 1, xsizenew - 1) + clampIdx(x, ysizenew - 1) * xsizenew + clampIdx(z, zsizenew - 1) * xsizenew * ysizenew] +
+                                deltax * (1.0 - deltay)*(1.0 - deltaz) * input[clampIdx(y, xsizenew - 1) + clampIdx(x + 1, ysizenew - 1) * xsizenew + clampIdx(z, zsizenew - 1) * xsizenew * ysizenew]+
+                                (1.0 - deltax)*(1.0 - deltay) * deltaz * input[clampIdx(y, xsizenew - 1) + clampIdx(x, ysizenew - 1) * xsizenew + clampIdx(z + 1, zsizenew - 1) * xsizenew * ysizenew] +
+                                deltax * deltay * (1.0 - deltaz) * input[clampIdx(y + 1, xsizenew - 1) + clampIdx(x + 1, ysizenew - 1) * xsizenew + clampIdx(z, zsizenew - 1) * xsizenew * ysizenew]+
+                                (1.0 - deltax) * deltay * deltaz * input[clampIdx(y + 1, xsizenew - 1) + clampIdx(x, ysizenew - 1) * xsizenew + clampIdx(z + 1, zsizenew - 1) * xsizenew * ysizenew] +
+                                deltax * (1.0 - deltay) * deltaz * input[clampIdx(y, xsizenew - 1) + clampIdx(x + 1, ysizenew - 1) * xsizenew + clampIdx(z + 1, zsizenew - 1) * xsizenew * ysizenew] +
+                                deltax * deltay * deltaz * input[clampIdx(y + 1, xsizenew - 1) + clampIdx(x + 1, ysizenew - 1) * xsizenew + clampIdx(z + 1, zsizenew - 1) * xsizenew * ysizenew];
                     }
                 }
             }
         }
 
         void
-        InterpDeformationFld(float* fldx_in, float* fldy_in, float* fldz_in, float* fldx, float* fldy, float* fldz, int xsize_in, int ysize_in, int zsize_in, int xsize, int ysize, int zsize) {
+        InterpDeformationFld(float* fldx_in, float* fldy_in, float* fldz_in, float* fldx, float* fldy, float* fldz, vidx xsize_in, vidx ysize_in, vidx zsize_in, vidx xsize, vidx ysize, vidx zsize) {
 
 
             float scale_m = (float) xsize_in / (float) xsize;
@@ -351,9 +374,9 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             float* x1 = new float[xsize_in * ysize_in * zsize_in];
             float* y1 = new float[xsize_in * ysize_in * zsize_in];
             float* z1 = new float[xsize_in * ysize_in * zsize_in];
-            for (int k = 0; k < zsize_in; k++) {
-                for (int j = 0; j < ysize_in; j++) {
-                    for (int i = 0; i < xsize_in; i++) {
+            for (vidx k = 0; k < zsize_in; k++) {
+                for (vidx j = 0; j < ysize_in; j++) {
+                    for (vidx i = 0; i < xsize_in; i++) {
                         x1[i + j * xsize_in + k * xsize_in * ysize_in] = j / scale_n;
                         y1[i + j * xsize_in + k * xsize_in * ysize_in] = i / scale_m;
                         z1[i + j * xsize_in + k * xsize_in * ysize_in] = k / scale_o;
@@ -372,7 +395,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
         }
 
         void
-        fldinv(float* fldx_in, float* fldy_in, float* fldz_in, float* fldx, float* fldy, float* fldz, int m, int n, int o) {
+        fldinv(float* fldx_in, float* fldy_in, float* fldz_in, float* fldx, float* fldy, float* fldz, vidx m, vidx n, vidx o) {
             float* un = new float[m * n * o];
             float* vn = new float[m * n * o];
             float* wn = new float[m * n * o];
@@ -380,7 +403,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             float* vin = new float[m * n * o];
             float* win = new float[m * n * o];
 
-            for (int i = 0; i < m * n * o; i++) {
+            for (vidx i = 0; i < m * n * o; i++) {
                 uin[i] = -fldx[i];
                 vin[i] = -fldy[i];
                 win[i] = -fldz[i];
@@ -392,7 +415,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                 interpolate3d(un, uin, fldx_in, fldy_in, fldz_in, m, n, o, m, n, o, true);
                 interpolate3d(vn, vin, fldx_in, fldy_in, fldz_in, m, n, o, m, n, o, true);
                 interpolate3d(wn, win, fldx_in, fldy_in, fldz_in, m, n, o, m, n, o, true);
-                for (int i = 0; i < m * n * o; i++) {
+                for (vidx i = 0; i < m * n * o; i++) {
                     fldx_in[i] = un[i];
                     fldy_in[i] = vn[i];
                     fldz_in[i] = wn[i];
@@ -408,7 +431,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
         }
 
         void
-        combineDeformation(float* fldx, float* fldy, float* fldz, float* fldx1, float* fldy1, float* fldz1, float* fldx2, float* fldy2, float* fldz2, int m, int n, int o) {
+        combineDeformation(float* fldx, float* fldy, float* fldz, float* fldx1, float* fldy1, float* fldz1, float* fldx2, float* fldy2, float* fldz2, vidx m, vidx n, vidx o) {
             float* uc = new float[m * n * o];
             float* vc = new float[m * n * o];
             float* wc = new float[m * n * o];
@@ -417,7 +440,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             interpolate3d(vc, fldy1, fldx2, fldy2, fldz2, m, n, o, m, n, o, true);
             interpolate3d(wc, fldz1, fldx2, fldy2, fldz2, m, n, o, m, n, o, true);
 
-            for (int i = 0; i < m * n * o; i++) {
+            for (vidx i = 0; i < m * n * o; i++) {
                 fldx[i] = uc[i] + fldx2[i];
                 fldy[i] = vc[i] + fldy2[i];
                 fldz[i] = wc[i] + fldz2[i];
@@ -430,7 +453,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
         }
 
         void
-        smoothDfm(float* fldx, float* fldy, float *fldz, int m, int n, int o, int expsteps, int factor) {
+        smoothDfm(float* fldx, float* fldy, float *fldz, vidx m, vidx n, vidx o, int expsteps, int factor) {
             float* fldx1 = new float[m * n * o];
             float* fldy1 = new float[m * n * o];
             float* fldz1 = new float[m * n * o];
@@ -441,7 +464,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 
             float scale = 1.0 / (float) factor;
             float coeff = 1.0 / (float) powf(2.0, expsteps);
-            for (int i = 0; i < m * n * o; i++) {
+            for (vidx i = 0; i < m * n * o; i++) {
                 fldx1[i] = coeff * fldx[i] * scale;
                 fldy1[i] = coeff * fldy[i] * scale;
                 fldz1[i] = coeff * fldz[i] * scale;
@@ -449,13 +472,13 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             }
             for (int it = 0; it < expsteps; it++) {
                 combineDeformation(fldx2, fldy2, fldz2, fldx1, fldy1, fldz1, fldx1, fldy1, fldz1, m, n, o);
-                for (int i = 0; i < m * n * o; i++) {
+                for (vidx i = 0; i < m * n * o; i++) {
                     fldx1[i] = fldx2[i];
                     fldy1[i] = fldy2[i];
                     fldz1[i] = fldz2[i];
                 }
             }
-            for (int i = 0; i < m * n * o; i++) {
+            for (vidx i = 0; i < m * n * o; i++) {
                 fldx[i] = fldx2[i]*(float) factor;
                 fldy[i] = fldy2[i]*(float) factor;
                 fldz[i] = fldz2[i]*(float) factor;
@@ -471,7 +494,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
         }
 
         void
-        symmetricMapping(float* xforward, float* yforward, float* zforward, float* xbackward, float* ybackward, float* zbackward, int m, int n, int o, int factor) {
+        symmetricMapping(float* xforward, float* yforward, float* zforward, float* xbackward, float* ybackward, float* zbackward, vidx m, vidx n, vidx o, int factor) {
             float factor1 = 1.0 / (float) factor;
             float* usym = new float[m* n * o];
             float* vsym = new float[m* n * o];
@@ -480,7 +503,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             float* vsym2 = new float[m* n * o];
             float* wsym2 = new float[m* n * o];
 
-            for (int i = 0; i < m * n * o; i++) {
+            for (vidx i = 0; i < m * n * o; i++) {
                 usym[i] = xforward[i]*(factor1 * 0.5);
                 vsym[i] = yforward[i]*(factor1 * 0.5);
                 wsym[i] = zforward[i]*(factor1 * 0.5);
@@ -501,7 +524,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             combineDeformation(xforward, yforward, zforward, u2i, v2i, w2i, usym, vsym, wsym, m, n, o);
             combineDeformation(xbackward, ybackward, zbackward, ui, vi, wi, usym2, vsym2, wsym2, m, n, o);
 
-            for (int i = 0; i < m * n * o; i++) {
+            for (vidx i = 0; i < m * n * o; i++) {
                 xforward[i] *= (float) factor;
                 yforward[i] *= (float) factor;
                 zforward[i] *= (float) factor;
@@ -530,16 +553,17 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 
             using namespace std;
 
-            int sizex = ctx.sizeX;
-            int sizey = ctx.sizeY;
-            int sizez = ctx.sizeZ;
+            vidx sizex = ctx.sizeX;
+            vidx sizey = ctx.sizeY;
+            vidx sizez = ctx.sizeZ;
 
-            int gridsizex = sizex / stepsize;
-            int gridsizey = sizey / stepsize;
-            int gridsizez = sizez / stepsize;
+            int gridsizex = static_cast<int>(sizex / stepsize);
+            int gridsizey = static_cast<int>(sizey / stepsize);
+            int gridsizez = static_cast<int>(sizez / stepsize);
 
 
-            int gridsizevol = gridsizex * gridsizey*gridsizez;
+            // node count x label count is the cost-volume stride: 64-bit.
+            vidx gridsizevol = static_cast<vidx>(gridsizex) * gridsizey * gridsizez;
 
             // deformation field
             int searchsize = hw * 2 + 1;
@@ -556,7 +580,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                     }
                 }
             }
-            int searchvol = searchsize * searchsize*searchsize;
+            vidx searchvol = static_cast<vidx>(searchsize) * searchsize * searchsize;
 
             int *labels = new int[gridsizevol];
             short *indexall = new short[gridsizevol * searchvol];
@@ -565,15 +589,15 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             int *index = new int[searchvol];
 
 
-            for (int i = 0; i < searchvol; i++) {
+            for (vidx i = 0; i < searchvol; i++) {
                 energy[i] = 0;
             }
 
-            int frac = (int) (gridsizevol / 25);
+            int frac = (int) (gridsizevol / 25);  // progress ticks only
             if (frac < 1) { frac = 1; }  // guard: i % frac below
 
             //calculate cost
-            for (int i = (gridsizevol - 1); i > 0; i--) { //do for each control point
+            for (vidx i = (gridsizevol - 1); i > 0; i--) { //do for each control point
                 if ((i % frac) == 0) {
                     cout << "x" << flush;
                 }
@@ -587,7 +611,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                 int xlast = (last - zlast * gridsizex * gridsizey) / gridsizex;
                 int ylast = last - zlast * gridsizex * gridsizey - xlast*gridsizex;
 
-                for (int l = 0; l < searchvol; l++) {
+                for (vidx l = 0; l < searchvol; l++) {
                     energy[l] = costMatrix[next + l * gridsizevol];
                 }
 
@@ -597,11 +621,11 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 
                 regulate(energy, index, searchsize, deltax, deltay, deltaz);
 
-                for (int l = 0; l < searchvol; l++) {
+                for (vidx l = 0; l < searchvol; l++) {
                     indexall[ynext + xnext * gridsizex + znext * gridsizex * gridsizey + l * gridsizevol] = index[l];
                 }
 
-                for (int l = 0; l < searchvol; l++) {
+                for (vidx l = 0; l < searchvol; l++) {
                     costMatrix[last + l * gridsizevol] += energy[l];
                 }
 
@@ -613,13 +637,13 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             int z1 = oroot / (gridsizex * gridsizey);
             int x1 = (oroot - z1 * gridsizex * gridsizey) / gridsizex;
             int y1 = oroot - z1 * gridsizex * gridsizey - x1*gridsizex;
-            for (int l = 0; l < searchvol; l++) {
+            for (vidx l = 0; l < searchvol; l++) {
                 energy[l] = costMatrix[oroot + l * gridsizevol];
             }
             float value;
             int ind;
             minimumInd(energy, value, ind, searchvol);
-            for (int l = 0; l < searchvol; l++) {
+            for (vidx l = 0; l < searchvol; l++) {
                 indexall[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey + l * gridsizevol] = l;
             }
             labels[y1 + x1 * gridsizex + z1 * gridsizex * gridsizey] = ind;
@@ -629,7 +653,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 
 
             //compute displacements 
-            for (int i = 1; i < gridsizevol; i++) {
+            for (vidx i = 1; i < gridsizevol; i++) {
                 int next = sorted[i];
                 int last = relations[sorted[i]];
                 int z1 = next / (gridsizex * gridsizey);
@@ -669,15 +693,16 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 
             float gamma = (float) gridstep / (lambda * (float) mingrid);
 
-            int m = ctx.sizeX;
-            int n = ctx.sizeY;
-            int o = ctx.sizeZ;
-            int sz = m*n*o;
+            vidx m = ctx.sizeX;
+            vidx n = ctx.sizeY;
+            vidx o = ctx.sizeZ;
+            vidx sz = m*n*o;
 
-            int gridx = m / gridstep;
-            int gridy = n / gridstep;
-            int gridz = o / gridstep;
-            int sz1 = gridx*gridy*gridz;
+            int gridx = static_cast<int>(m / gridstep);
+            int gridy = static_cast<int>(n / gridstep);
+            int gridz = static_cast<int>(o / gridstep);
+            // node count; multiplied by the label count below as a cost-volume stride.
+            vidx sz1 = static_cast<vidx>(gridx)*gridy*gridz;
 
             int len = hw * 2 + 1;
             int lengthfull = (int) pow(len, 3.0);
@@ -709,16 +734,16 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             const float binSizeFixed = ctx.maxFixed / ctx.numBin;
             const float binSizeMoving = ctx.maxMoving / ctx.numBin;
 
-            int mi = m;
-            int ni = n;
-            int oi = o;
+            vidx mi = m;
+            vidx ni = n;
+            vidx oi = o;
 
             if (subpixel) {
                 //interpolation 
                 mi *= 2;
                 ni *= 2;
                 oi *= 2;
-                int szi = mi*ni*oi;
+                vidx szi = mi*ni*oi;
                 float* x1 = new float[szi];
                 float* y1 = new float[szi];
                 float* z1 = new float[szi];
@@ -747,7 +772,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             } else {
                 movingi = new float[sz];
                 movingiInd = new int[sz];
-                for (int i = 0; i < sz; i++) {
+                for (vidx i = 0; i < sz; i++) {
                     movingi[i] = moving[i];
                 }
 
@@ -756,7 +781,7 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 
             fixed = new float[m * n * o];
             fixedInd = new int[m * n * o];
-            for (int i = 0; i < m * n * o; i++) {
+            for (vidx i = 0; i < m * n * o; i++) {
 
                 fixed[i] = imgFix[i];
                 fixedInd[i] = (int) floor(fixed[i] / binSizeFixed);
@@ -777,19 +802,19 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             if (frac < 1) { frac = 1; }  // guard: i % frac below
 
             float epsilon = gamma / (float) maxsamp;
-            int xind, yind, zind;
+            vidx xind, yind, zind;
 
             {
                 float* normalizerA = new float[lengthfull];
                 float* normalizerB = new float[lengthfull];
 
-                for (int i = 0; i < sz1; i++) {
+                for (vidx i = 0; i < sz1; i++) {
                     if ((i % frac) == 0) {
                         cout << "x" << flush;
                     }
-                    int z1 = i / (gridx * gridy);
-                    int x1 = (i - z1 * gridx * gridy) / gridx;
-                    int y1 = i - z1 * gridx * gridy - x1*gridx;
+                    vidx z1 = i / (static_cast<vidx>(gridx) * gridy);
+                    vidx x1 = (i - z1 * gridx * gridy) / gridx;
+                    vidx y1 = i - z1 * gridx * gridy - x1*gridx;
 
                     z1 *= gridstep;
                     x1 *= gridstep;
@@ -828,9 +853,9 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                         }
                         else
                             i1 = j1;
-                        int zz = i1 / (gridstep * gridstep);
-                        int xx = (i1 - zz * gridstep * gridstep) / gridstep;
-                        int yy = i1 - zz * gridstep * gridstep - xx*gridstep;
+                        vidx zz = i1 / (gridstep * gridstep);
+                        vidx xx = (i1 - zz * gridstep * gridstep) / gridstep;
+                        vidx yy = i1 - zz * gridstep * gridstep - xx*gridstep;
 
                         xx += x1;
                         yy += y1;
@@ -839,13 +864,13 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                         for (int l = 0; l < lengthfull; l++) {
                             if (!(boundaries)) {
                                 if (subpixel) {
-                                    xind = max(min(xx * 2 + (int) xs[l], ni - 1), 0);
-                                    yind = max(min(yy * 2 + (int) ys[l], mi - 1), 0);
-                                    zind = max(min(zz * 2 + (int) zs[l], oi - 1), 0);
+                                    xind = clampIdx(xx * 2 + (int) xs[l], ni - 1);
+                                    yind = clampIdx(yy * 2 + (int) ys[l], mi - 1);
+                                    zind = clampIdx(zz * 2 + (int) zs[l], oi - 1);
                                 } else {
-                                    xind = max(min(xx + (int) (xs[l]), ni - 1), 0);
-                                    yind = max(min(yy + (int) (ys[l]), mi - 1), 0);
-                                    zind = max(min(zz + (int) (zs[l]), oi - 1), 0);
+                                    xind = clampIdx(xx + (int) (xs[l]), ni - 1);
+                                    yind = clampIdx(yy + (int) (ys[l]), mi - 1);
+                                    zind = clampIdx(zz + (int) (zs[l]), oi - 1);
                                 }
                             } else {
                                 if (subpixel) {
@@ -889,9 +914,9 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 
         void
         updateImage(MrfContext & ctx, float* warped, float* imgFix, float* imgMov, float* u1, float* v1, float* w1) {
-            int m = ctx.sizeX;
-            int n = ctx.sizeY;
-            int o = ctx.sizeZ;
+            vidx m = ctx.sizeX;
+            vidx n = ctx.sizeY;
+            vidx o = ctx.sizeZ;
 
 
             float metric = 0;
@@ -900,9 +925,9 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 
             interpolate3d(warped, imgFix, u1, v1, w1, m, n, o, m, n, o, true);
 
-            for (int i = 0; i < m; i++) {
-                for (int j = 0; j < n; j++) {
-                    for (int k = 0; k < o; k++) {
+            for (vidx i = 0; i < m; i++) {
+                for (vidx j = 0; j < n; j++) {
+                    for (vidx k = 0; k < o; k++) {
                         metric += pow(imgMov[i + j * m + k * m * n] - warped[i + j * m + k * m * n], 2);
                         metric_start += pow(imgMov[i + j * m + k * m * n] - imgFix[i + j * m + k * m * n], 2);
                     }
@@ -923,6 +948,38 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
 // model directory off the LIMS dispatcher; the coarse-to-fine schedule, the
 // forward/backward pairing and the symmetric composition are unchanged.
 // ---------------------------------------------------------------------------
+long long
+EstimateDeformablePeakBytes(int sizeX, int sizeY, int sizeZ, const DeformableParameters & params)
+{
+  const long long vox = static_cast<long long>(sizeX) * sizeY * sizeZ;
+
+  // Mirror the schedule RunDeformableRegistration derives: ceil-halve the grid each
+  // level, and stop once the spacing bottoms out and would repeat.
+  long long worstLevel = 0;
+  int       step = params.gridStart > 0 ? params.gridStart : 1;
+  int       previous = 0;
+  for (int level = 0; level < params.numLevels; ++level)
+  {
+    if (level > 0)
+    {
+      previous = step;
+      step = static_cast<int>(std::ceil(step / 2.0));
+      if (step == previous) { break; }
+    }
+    const long long hw = static_cast<long long>(std::ceil(step / 2.0));
+    const long long side = 2 * hw + 1;
+    const long long labels = side * side * side;
+    const long long nodes = std::max(1LL, static_cast<long long>(sizeX / step)) *
+                            std::max(1LL, static_cast<long long>(sizeY / step)) *
+                            std::max(1LL, static_cast<long long>(sizeZ / step));
+    // forward + backward cost volume, float each
+    worstLevel = std::max(worstLevel, 2LL * 4LL * nodes * labels);
+  }
+
+  return 190LL * vox + worstLevel + 20LL * 1024 * 1024;
+}
+
+// ---------------------------------------------------------------------------
 DeformableResult
 RunDeformableRegistration(const float *                imgFixIn,
                           const float *                imgMovIn,
@@ -931,7 +988,7 @@ RunDeformableRegistration(const float *                imgFixIn,
                           int                          sizeZ,
                           const DeformableParameters & params)
 {
-  const int volsize = sizeX * sizeY * sizeZ;
+  const vidx volsize = static_cast<vidx>(sizeX) * sizeY * sizeZ;
 
   MrfContext ctx;
   ctx.sizeX = sizeX;
@@ -944,7 +1001,7 @@ RunDeformableRegistration(const float *                imgFixIn,
   // similarity histogram bins correctly whatever the input range is.
   ctx.maxFixed = 0.0f;
   ctx.maxMoving = 0.0f;
-  for (int i = 0; i < volsize; ++i)
+  for (vidx i = 0; i < volsize; ++i)
   {
     ctx.maxFixed = max(ctx.maxFixed, imgFixIn[i]);
     ctx.maxMoving = max(ctx.maxMoving, imgMovIn[i]);

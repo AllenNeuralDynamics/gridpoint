@@ -167,6 +167,69 @@ The inverse direction scores about what the forward direction does (0.8889), whi
 symmetry showing up where it should. Both wrong variants land at or below the affine-only
 baseline, so a convention mistake here is loud rather than subtle.
 
+## Memory
+
+The deformable stage holds the whole volume in RAM -- the discrete optimization is a
+global minimum-spanning-tree message pass over the control grid, so there is nothing to
+tile or stream. Peak usage is therefore set almost entirely by voxel count:
+
+```
+peak  ~=  190 bytes/voxel  +  the largest single level's cost volumes  +  ~20 MiB
+```
+
+Measured against peak working set, with the default grid schedule:
+
+| Volume | Voxels | Measured peak |
+|---|---|---|
+| 64^3 | 262,144 | 64 MiB |
+| 96^3 | 884,736 | 200 MiB |
+| 128^3 | 2,097,152 | 418 MiB |
+| 160^3 | 4,096,000 | 808 MiB |
+
+The cost-volume term is the only part the parameters move: each level allocates
+`nodes x labels x 4` bytes twice (forward and backward). Those two factors nearly cancel
+across the schedule -- coarse levels have few nodes over a huge label space, fine levels
+the reverse -- so the per-level figures stay within about 2x of each other and peak at
+the *finest* level.
+
+What that means at atlas scale:
+
+| Case | Shape | Voxels | Estimated peak |
+|---|---|---|---|
+| CCF 100 um | 132x80x114 | 1,203,840 | 256 MiB |
+| CCF 50 um | 264x160x228 | 9,630,720 | 1.9 GiB |
+| CCF 25 um | 528x320x456 | 77,045,760 | 14.8 GiB |
+| STPT 20 um | 600x400x500 | 120,000,000 | 23.0 GiB |
+| CCF 10 um | 1320x800x1140 | 1,203,840,000 | 230.6 GiB |
+
+gridpoint prints this estimate before the deformable stage starts, and warns if it
+exceeds the machine's physical memory. The estimate uses the schedule you asked for, not
+the capped one, so on small images where the level or grid caps fire it reads slightly
+high.
+
+### Fitting a large registration
+
+Memory scales with voxel count, so halving the resolution costs about **8x less**.
+Register coarse and apply the result at full resolution:
+
+```
+gridpoint -f fixed_25um.nii.gz -m moving_25um.nii.gz -o out --write-deformation-field
+antsApplyTransforms -d 3 -i moving_10um.nii.gz -r fixed_10um.nii.gz -o warped_10um.nii.gz \
+    -t out/stpt_Warp.nii.gz -t out/stpt_Affine.txt
+```
+
+**`--grid` is specified in voxels, not microns.** If you change resolution, scale the
+schedule by the same factor or you are optimizing a physically different deformation --
+the default `30,15,8,4` means 750/375/200/100 um at 25 um, but 300/150/80/40 um at 10 um.
+
+Little is lost doing this. The finest control grid is 4 voxels, so the field was never
+going to carry detail below that; registering finer buys a denser sampling of the metric,
+not a finer warp. On a 96^3 textured phantom, halving the resolution and applying the
+result at full resolution scored NCC 0.9110 against 0.8862 for registering at full
+resolution directly -- though that phantom's warp is a smooth global sinusoid, which
+downsampling preserves almost perfectly, so treat it as evidence that the loss is small
+rather than that it is negative.
+
 ## Validation
 
 **Linear stages.** On synthetic pairs with a known translation the recovered transform

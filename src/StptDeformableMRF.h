@@ -62,6 +62,18 @@ struct DeformableResult
   int                gridStartUsed{ 0 };
 };
 
+/** Rough peak resident bytes for RunDeformableRegistration on this shape.
+ *
+ *  Calibrated against measured peak working set at 64/96/128/160 cubed: about
+ *  190 bytes per voxel of persistent and scratch buffers, plus the largest single
+ *  level's discrete cost volumes (which depend on the grid schedule, so they are
+ *  computed rather than folded into the per-voxel figure), plus a small baseline.
+ *  Within ~5% of measurement over that range. A planning number, not a guarantee --
+ *  it counts allocations, not allocator slack or page-level behaviour.
+ */
+long long
+EstimateDeformablePeakBytes(int sizeX, int sizeY, int sizeZ, const DeformableParameters & params);
+
 /** Run the discrete symmetric deformable registration.
  *
  *  `imgFix` and `imgMov` are x-fastest buffers of size sizeX*sizeY*sizeZ, already
