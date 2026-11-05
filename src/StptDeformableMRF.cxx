@@ -787,6 +787,20 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                 fixedInd[i] = (int) floor(fixed[i] / binSizeFixed);
             }
 
+            // The label offsets xs/ys/zs are fixed for the whole call, and in subpixel mode
+            // already carry the x2 scaling applied above. Fold each label's three offsets into
+            // a single flat buffer offset so the interior case below costs one add per label
+            // instead of three float-to-int conversions and two multiplies.
+            std::vector<int>  xsi(lengthfull), ysi(lengthfull), zsi(lengthfull);
+            std::vector<vidx> labelOffset(lengthfull);
+            for (int l = 0; l < lengthfull; l++) {
+                xsi[l] = (int) xs[l];
+                ysi[l] = (int) ys[l];
+                zsi[l] = (int) zs[l];
+                labelOffset[l] = static_cast<vidx>(ysi[l]) + static_cast<vidx>(xsi[l]) * mi
+                               + static_cast<vidx>(zsi[l]) * mi * ni;
+            }
+
             int samples = ctx.sampleNum;
             bool randommode = samples < pow(gridstep, 3);
             int maxsamp;
@@ -805,7 +819,6 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
             vidx xind, yind, zind;
 
             {
-                float* normalizerA = new float[lengthfull];
                 float* normalizerB = new float[lengthfull];
 
                 for (vidx i = 0; i < sz1; i++) {
@@ -835,9 +848,13 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                     }
 
 
+                    // normalizerA was an array indexed by label, but what it accumulates --
+                    // the squared fixed-image intensity -- has no label dependence whatsoever,
+                    // so every entry held the same number. One scalar replaces the array, and
+                    // the accumulation moves out of the label loop entirely.
+                    float normA = 0.0f;
                     for (int l = 0; l < lengthfull; l++) {
                         cost1[l] = 0.0;
-                        normalizerA[l] = 0.0;
                         normalizerB[l] = 0.0;
                     }
 
@@ -861,40 +878,45 @@ newRelation(Relation edge1, Relation & edgeout, bool * vertices)
                         yy += y1;
                         zz += z1;
 
-                        for (int l = 0; l < lengthfull; l++) {
-                            if (!(boundaries)) {
-                                if (subpixel) {
-                                    xind = clampIdx(xx * 2 + (int) xs[l], ni - 1);
-                                    yind = clampIdx(yy * 2 + (int) ys[l], mi - 1);
-                                    zind = clampIdx(zz * 2 + (int) zs[l], oi - 1);
-                                } else {
-                                    xind = clampIdx(xx + (int) (xs[l]), ni - 1);
-                                    yind = clampIdx(yy + (int) (ys[l]), mi - 1);
-                                    zind = clampIdx(zz + (int) (zs[l]), oi - 1);
-                                }
-                            } else {
-                                if (subpixel) {
-                                    xind = xx * 2 + (int) xs[l];
-                                    yind = yy * 2 + (int) ys[l];
-                                    zind = zz * 2 + (int) zs[l];
-                                } else {
-                                    xind = xx + (int) xs[l];
-                                    yind = yy + (int) ys[l];
-                                    zind = zz + (int) zs[l];
-                                }
+                        // One load and one square of the fixed sample per sample, rather than
+                        // repeating both for every one of the (up to 29791) labels.
+                        const float fv = fixed[yy + xx * m + zz * m * n];
+                        normA += fv * fv;
+
+                        const vidx bx = subpixel ? xx * 2 : xx;
+                        const vidx by = subpixel ? yy * 2 : yy;
+                        const vidx bz = subpixel ? zz * 2 : zz;
+
+                        if (boundaries) {
+                            // Interior node: every label lands inside the volume, so both the
+                            // clamp and the per-label index arithmetic fall away and the moving
+                            // sample is one offset from a fixed base.
+                            const vidx base = by + bx * mi + bz * mi * ni;
+                            for (int l = 0; l < lengthfull; l++) {
+                                const float mv = movingi[base + labelOffset[l]];
+                                cost1[l] += fv * mv;
+                                normalizerB[l] += mv * mv;
                             }
-                            cost1[l] += fixed[yy + xx * m + zz * m * n] * movingi[yind + xind * mi + zind * mi * ni];
-                            normalizerA[l] += powf(fixed[yy + xx * m + zz * m * n], 2.0);
-                            normalizerB[l] += powf(movingi[yind + xind * mi + zind * mi * ni], 2.0);
+                        } else {
+                            for (int l = 0; l < lengthfull; l++) {
+                                xind = clampIdx(bx + xsi[l], ni - 1);
+                                yind = clampIdx(by + ysi[l], mi - 1);
+                                zind = clampIdx(bz + zsi[l], oi - 1);
+                                const float mv = movingi[yind + xind * mi + zind * mi * ni];
+                                cost1[l] += fv * mv;
+                                normalizerB[l] += mv * mv;
+                            }
                         }
                     }
 
                     for (int l = 0; l < lengthfull; l++) {
-                        energy[i + l * sz1] = epsilon * (1 - pow(double(cost1[l] * cost1[l] / normalizerA[l] / normalizerB[l]), 2));
+                        // Squaring, not a general pow. The ratio stays in float exactly as
+                        // upstream computed it, so the rounding sequence is unchanged.
+                        const float q = cost1[l] * cost1[l] / normA / normalizerB[l];
+                        energy[i + l * sz1] = epsilon * (1 - double(q) * double(q));
                     }
                 }
 
-                delete []normalizerA;
                 delete []normalizerB;
             }
 
@@ -1138,6 +1160,7 @@ RunDeformableRegistration(const float *                imgFixIn,
     smoothDfm(xlabel.data(), ylabel.data(), zlabel.data(), xsizethis, ysizethis, zsizethis, 4, stepsize);
     smoothDfm(xlabelinv.data(), ylabelinv.data(), zlabelinv.data(), xsizethis, ysizethis, zsizethis, 4, stepsize);
     // The step that makes the result symmetric and invertible.
+    if (params.verbose) { std::cerr << "      [step] symmetricMapping" << std::endl; }
     symmetricMapping(xlabel.data(), ylabel.data(), zlabel.data(),
                      xlabelinv.data(), ylabelinv.data(), zlabelinv.data(),
                      xsizethis, ysizethis, zsizethis, stepsize);
