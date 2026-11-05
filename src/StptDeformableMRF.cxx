@@ -341,15 +341,12 @@ parallelFor(vidx count, Body body)
         }
 
         void
-        regulate(float* r, int* indr, int rl, float dx, float dy, float dz) {
+        regulate(float* r, int* indr, int rl, float dx, float dy, float dz,
+                 int* v, float* z, float* f, int* i1) {
 
             for (int i = 0; i < rl * rl * rl; i++) {
                 indr[i] = i;
             }
-            int* v = new int[rl];
-            float* z = new float[rl + 1];
-            float* f = new float[rl];
-            int* i1 = new int[rl];
 
             for (int k = 0; k < rl; k++) {
                 for (int i = 0; i < rl; i++) {
@@ -367,13 +364,6 @@ parallelFor(vidx count, Body body)
                     energy(r + i + j*rl, indr + i + j*rl, rl, -dz, rl*rl, v, z, f, i1);
                 }
             }
-            delete []i1;
-            delete []f;
-
-            delete []v;
-            delete []z;
-
-
         }
 
         void
@@ -642,6 +632,7 @@ parallelFor(vidx count, Body body)
             int *index = new int[searchvol];
 
 
+
             for (vidx i = 0; i < searchvol; i++) {
                 energy[i] = 0;
             }
@@ -650,41 +641,98 @@ parallelFor(vidx count, Body body)
             if (frac < 1) { frac = 1; }  // guard: i % frac below
 
             //calculate cost
-            for (vidx i = (gridsizevol - 1); i > 0; i--) { //do for each control point
-                if ((i % frac) == 0) {
-                    cout << "x" << flush;
+            // ---------------------------------------------------------------------
+            // Message passing up the tree, parallelized over nodes at equal depth.
+            //
+            // The serial version walked i downward, which is deepest-depth-first, and
+            // every node both READ its own cost slice and ACCUMULATED into its parent's.
+            // Nodes at the same depth are independent in the first respect but not the
+            // second: siblings share a parent, so a naive parallel loop would race on
+            // costMatrix[parent].
+            //
+            // So the work is split. Pass 1 is the expensive, wholly independent part
+            // (the cost read and regulate()), run in parallel over nodes. Pass 2 is the
+            // parent accumulation, run in parallel over LABELS -- for a fixed label no
+            // two nodes touch the same address, and within each label the nodes are
+            // visited in the original descending-i order. The summation order per
+            // parent is therefore unchanged, which is what keeps the result bit-exact
+            // rather than merely equivalent.
+            // ---------------------------------------------------------------------
+
+            // `sorted` is already grouped by tree depth (DfmfldModulation emits it that
+            // way), so a node's parent always appears earlier and depth falls out of a
+            // single forward pass.
+            std::vector<int> nodeDepth(gridsizevol, 0);
+            for (vidx i = 1; i < gridsizevol; i++) {
+                const int node = sorted[i];
+                nodeDepth[node] = nodeDepth[relations[node]] + 1;
+            }
+            std::vector<vidx> levelStart;
+            levelStart.push_back(0);
+            for (vidx i = 1; i < gridsizevol; i++) {
+                if (nodeDepth[sorted[i]] != nodeDepth[sorted[i - 1]]) { levelStart.push_back(i); }
+            }
+            levelStart.push_back(gridsizevol);
+
+            // One tile of same-depth nodes' energies, capped so the scratch stays bounded
+            // whatever the depth profile of the tree turns out to be.
+            const vidx tileCap = std::max<vidx>(1, (512LL << 20) / (searchvol * 4));
+            std::vector<float> tileEnergy;
+
+            for (vidx lev = static_cast<vidx>(levelStart.size()) - 2; lev >= 1; lev--) {
+                const vidx levBegin = levelStart[lev];
+                const vidx levEnd = levelStart[lev + 1];
+
+                for (vidx tileEnd = levEnd; tileEnd > levBegin; ) {
+                    const vidx tileBegin = std::max(levBegin, tileEnd - tileCap);
+                    const vidx tileCount = tileEnd - tileBegin;
+                    tileEnergy.resize(static_cast<size_t>(tileCount) * searchvol);
+
+                    // Pass 1: independent per node. Slot t holds the node at i = tileEnd-1-t,
+                    // so ascending t is descending i, matching the serial walk.
+                    parallelFor(tileCount, [&](vidx chunkBegin, vidx chunkEnd) {
+                        std::vector<int>   idxBuf(searchvol);
+                        std::vector<int>   vBuf(searchsize);
+                        std::vector<float> zBuf(searchsize + 1);
+                        std::vector<float> fBuf(searchsize);
+                        std::vector<int>   i1Buf(searchsize);
+                        for (vidx t = chunkBegin; t < chunkEnd; t++) {
+                            const int  node = sorted[tileEnd - 1 - t];
+                            const int  parent = relations[node];
+                            const vidx nodeBase = static_cast<vidx>(node) * searchvol;
+                            float *    e = tileEnergy.data() + t * searchvol;
+
+                            for (vidx l = 0; l < searchvol; l++) { e[l] = costMatrix[nodeBase + l]; }
+
+                            // fldx0[last] and fldx0[next] -- upstream spelled both indices
+                            // out longhand from the same decomposition.
+                            const float deltax = (fldx0[parent] - fldx0[node]) / (float) gridmin;
+                            const float deltay = (fldy0[parent] - fldy0[node]) / (float) gridmin;
+                            const float deltaz = (fldz0[parent] - fldz0[node]) / (float) gridmin;
+
+                            regulate(e, idxBuf.data(), searchsize, deltax, deltay, deltaz,
+                                     vBuf.data(), zBuf.data(), fBuf.data(), i1Buf.data());
+
+                            for (vidx l = 0; l < searchvol; l++) {
+                                indexall[nodeBase + l] = idxBuf[l];
+                            }
+                        }
+                    });
+
+                    // Pass 2: parent accumulation, sliced by label.
+                    parallelFor(searchvol, [&](vidx labelBegin, vidx labelEnd) {
+                        for (vidx t = 0; t < tileCount; t++) {
+                            const int    parent = relations[sorted[tileEnd - 1 - t]];
+                            const vidx   parentBase = static_cast<vidx>(parent) * searchvol;
+                            const float *e = tileEnergy.data() + t * searchvol;
+                            for (vidx l = labelBegin; l < labelEnd; l++) {
+                                costMatrix[parentBase + l] += e[l];
+                            }
+                        }
+                    });
+
+                    tileEnd = tileBegin;
                 }
-                int next = sorted[i];
-                int last = relations[sorted[i]];
-                int znext = next / (gridsizex * gridsizey);
-                int xnext = (next - znext * gridsizex * gridsizey) / gridsizex;
-                int ynext = next - znext * gridsizex * gridsizey - xnext*gridsizex;
-                
-                int zlast = last / (gridsizex * gridsizey);
-                int xlast = (last - zlast * gridsizex * gridsizey) / gridsizex;
-                int ylast = last - zlast * gridsizex * gridsizey - xlast*gridsizex;
-
-                // Contiguous: one node's labels now sit next to each other.
-                const vidx nextBase = static_cast<vidx>(next) * searchvol;
-                const vidx lastBase = static_cast<vidx>(last) * searchvol;
-                for (vidx l = 0; l < searchvol; l++) {
-                    energy[l] = costMatrix[nextBase + l];
-                }
-
-                float deltax = (fldx0[ylast + xlast * gridsizex + zlast * gridsizex * gridsizey] - fldx0[ynext + xnext * gridsizex + znext * gridsizex * gridsizey]) / (float) gridmin;
-                float deltay = (fldy0[ylast + xlast * gridsizex + zlast * gridsizex * gridsizey] - fldy0[ynext + xnext * gridsizex + znext * gridsizex * gridsizey]) / (float) gridmin;
-                float deltaz = (fldz0[ylast + xlast * gridsizex + zlast * gridsizex * gridsizey] - fldz0[ynext + xnext * gridsizex + znext * gridsizex * gridsizey]) / (float) gridmin;
-
-                regulate(energy, index, searchsize, deltax, deltay, deltaz);
-
-                for (vidx l = 0; l < searchvol; l++) {
-                    indexall[nextBase + l] = index[l];
-                }
-
-                for (vidx l = 0; l < searchvol; l++) {
-                    costMatrix[lastBase + l] += energy[l];
-                }
-
             }
 
             //compuate label
