@@ -1,5 +1,23 @@
 cmake_minimum_required(VERSION 3.16)
-project(gridpoint LANGUAGES C CXX)
+project(gridpoint VERSION 0.2.0 LANGUAGES C CXX)
+
+# Bake the version and the exact commit into the binary. Without this there is no way
+# to tell which build you are running: the Code Ocean postInstall clones, builds and
+# then deletes the source tree, so nothing on that machine records what went in.
+find_package(Git QUIET)
+set(GRIDPOINT_GIT_SHA "unknown")
+if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" rev-parse --short=12 HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE GRIDPOINT_GIT_SHA
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(NOT GRIDPOINT_GIT_SHA)
+    set(GRIDPOINT_GIT_SHA "unknown")
+  endif()
+endif()
+message(STATUS "gridpoint ${PROJECT_VERSION} (git ${GRIDPOINT_GIT_SHA})")
 # C is enabled only because ITK's HDF5 module reaches FindHDF5, which probes the
 # toolchain by compiling a .c file. A CXX-only project fails that probe outright.
 
@@ -38,6 +56,9 @@ add_executable(gridpoint
   src/StptDeformableMRF.cxx
 )
 target_include_directories(gridpoint PRIVATE src)
+target_compile_definitions(gridpoint PRIVATE
+  GRIDPOINT_VERSION="${PROJECT_VERSION}"
+  GRIDPOINT_GIT_SHA="${GRIDPOINT_GIT_SHA}")
 target_link_libraries(gridpoint PRIVATE ${ITK_LIBRARIES})
 
 install(TARGETS gridpoint RUNTIME DESTINATION bin)

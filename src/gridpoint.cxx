@@ -37,6 +37,21 @@
 namespace
 {
 
+// Set by CMake. The fallbacks keep a hand-built or tarball build compiling, and say
+// so honestly rather than claiming a version it cannot know.
+#ifndef GRIDPOINT_VERSION
+#  define GRIDPOINT_VERSION "unknown"
+#endif
+#ifndef GRIDPOINT_GIT_SHA
+#  define GRIDPOINT_GIT_SHA "unknown"
+#endif
+
+std::string
+VersionString()
+{
+  return std::string("gridpoint ") + GRIDPOINT_VERSION + " (git " + GRIDPOINT_GIT_SHA + ")";
+}
+
 void
 PrintUsage(const char * argv0)
 {
@@ -69,7 +84,8 @@ PrintUsage(const char * argv0)
     << "  --samples <n>                deformable random samples\n"
     << "  --warped-ext <.ext>          warped image extension (default .nii.gz)\n"
     << "  --write-deformation-field    also write the dense deformation fields\n"
-    << "  -v                           verbose\n\n"
+    << "  -v                           verbose\n"
+    << "  --version                    print version and exit\n\n"
     << "Outputs, written into <out_dir>:\n"
     << "  stpt_Affine.txt              collapsed rigid+affine transform (ITK, maps fixed->moving)\n"
     << "  stpt_Warped<ext>             moving image resampled onto the fixed grid\n"
@@ -193,6 +209,7 @@ main(int argc, char * argv[])
       else if (arg == "--write-deformation-field") { writeDeformationField = true; }
       else if (arg == "-v") { params.verbose = true; }
       else if (arg == "-h" || arg == "--help") { PrintUsage(argv[0]); return EXIT_SUCCESS; }
+      else if (arg == "--version") { std::cout << VersionString() << std::endl; return EXIT_SUCCESS; }
       else
       {
         std::cerr << "error: unknown option " << arg << "\n";
@@ -564,7 +581,7 @@ main(int argc, char * argv[])
     writer->Update();
 
     std::ofstream log(outDir + "/stpt.log");
-    log << "gridpoint\n"
+    log << VersionString() << "\n"
         << "fixed: " << fixedPath << "\n"
         << "moving: " << movingPath << "\n"
         << "stages: " << stagesText << "\n"

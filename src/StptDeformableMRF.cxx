@@ -626,7 +626,12 @@ parallelFor(vidx count, Body body)
             vidx searchvol = static_cast<vidx>(searchsize) * searchsize * searchsize;
 
             int *labels = new int[gridsizevol];
-            short *indexall = new short[gridsizevol * searchvol];
+            // Holds a label index, so it has to span searchvol. That is 29791 at the
+            // default coarsest grid of 30 -- under short's 32767 by about 10% -- but a
+            // grid of 31 already overflows, and the grid spacing is in VOXELS, so anyone
+            // matching the default's physical spacing at a finer resolution reaches for a
+            // larger number and silently corrupts the result. --grid 75 wants 456533.
+            int *indexall = new int[gridsizevol * searchvol];
             float *energy = new float[searchvol];
             float *values = new float[searchvol];
             int *index = new int[searchvol];
@@ -1267,11 +1272,14 @@ EstimateDeformablePeakBytes(int sizeX, int sizeY, int sizeZ, const DeformablePar
     // has returned before genDfm() is entered.
     const long long tileEnergy = std::min(512LL * 1024 * 1024, 4LL * nodes * labels);
 
+    // genDfm()'s per-label index array, one int per node per label.
+    const long long indexAll = 4LL * nodes * labels;
+
     // Depth and level bookkeeping in genDfm().
     const long long depthBytes = nodes * 4LL;
 
-    worstLevel =
-      std::max(worstLevel, costVolumes + std::max(sampleIdx, tileEnergy) + depthBytes);
+    worstLevel = std::max(worstLevel,
+                          costVolumes + indexAll + std::max(sampleIdx, tileEnergy) + depthBytes);
 
     samples = std::max(64LL, samples / 4);
   }
