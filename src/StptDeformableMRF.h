@@ -35,7 +35,6 @@ struct DeformableParameters
   int          gridStart{ 30 };     // coarsest control-grid spacing, voxels; halved per level
   float        lambda{ 1.0e-5f };   // smoothness weight on the MRF pairwise term
   int          sampleNum{ 1024 };   // random samples per node, quartered each level (floor 64)
-  unsigned int numBin{ 32 };        // histogram bins for the similarity term
   bool         verbose{ false };
 };
 
@@ -64,12 +63,14 @@ struct DeformableResult
 
 /** Rough peak resident bytes for RunDeformableRegistration on this shape.
  *
- *  Calibrated against measured peak working set at 64/96/128/160 cubed: about
- *  190 bytes per voxel of persistent and scratch buffers, plus the largest single
+ *  Calibrated against measured peak working set at 64/96/128/160/192 cubed: about
+ *  85 bytes per voxel of persistent and scratch buffers, plus the largest single
  *  level's discrete cost volumes (which depend on the grid schedule, so they are
  *  computed rather than folded into the per-voxel figure), plus a small baseline.
- *  Within ~5% of measurement over that range. A planning number, not a guarantee --
- *  it counts allocations, not allocator slack or page-level behaviour.
+ *  Deliberately biased high: over 96..192 cubed it lands between 0.98x and 1.12x of
+ *  measurement, and a pre-flight that under-predicts is worse than useless. The 64
+ *  cubed end reads 1.24x, where the fixed baseline dominates. A planning number, not
+ *  a guarantee -- it counts allocations, not allocator slack or page behaviour.
  */
 long long
 EstimateDeformablePeakBytes(int sizeX, int sizeY, int sizeZ, const DeformableParameters & params);

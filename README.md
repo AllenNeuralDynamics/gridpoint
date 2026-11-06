@@ -220,17 +220,33 @@ global minimum-spanning-tree message pass over the control grid, so there is not
 tile or stream. Peak usage is therefore set almost entirely by voxel count:
 
 ```
-peak  ~=  190 bytes/voxel  +  the largest single level's cost volumes  +  ~20 MiB
+peak  ~=  85 bytes/voxel  +  the largest single level's cost volumes  +  ~20 MiB
 ```
 
 Measured against peak working set, with the default grid schedule:
 
-| Volume | Voxels | Measured peak |
-|---|---|---|
-| 64^3 | 262,144 | 64 MiB |
-| 96^3 | 884,736 | 200 MiB |
-| 128^3 | 2,097,152 | 418 MiB |
-| 160^3 | 4,096,000 | 808 MiB |
+| Volume | Voxels | Measured peak | Before |
+|---|---|---|---|
+| 64^3 | 262,144 | 40 MiB | 64 MiB |
+| 96^3 | 884,736 | 121 MiB | 202 MiB |
+| 128^3 | 2,097,152 | 226 MiB | 418 MiB |
+| 160^3 | 4,096,000 | 433 MiB | 808 MiB |
+| 192^3 | 7,077,888 | 744 MiB | 1.36 GiB |
+
+The size-linear part of that fell from 201 to 106 bytes per voxel, with
+bit-identical output. Two things went:
+
+* **Sampling-coordinate arrays.** `interpolate3d` was handed three full-size float
+  arrays of where to sample. At the finest level that interpolation runs on a grid
+  twice as fine on every axis, so the three arrays are 96 bytes per voxel of the input
+  -- the single largest live allocation in the stage, and measurement put the peak
+  inside it. Every entry was the output index over a constant, so they are now derived
+  in the loop instead of stored.
+* **Mutual-information scaffolding.** The deformable stage scores with NCC (see
+  the metric note below); `--bins` only reaches the linear stages. It nonetheless built a
+  histogram-bin index per voxel for each image and a private copy of each image, and
+  read none of it. That was 16 bytes per voxel of allocation, though only about half of
+  it was ever written and so only half ever became resident.
 
 The cost-volume term is the only part the parameters move: each level allocates
 `nodes x labels x 4` bytes twice (forward and backward). Those two factors nearly cancel

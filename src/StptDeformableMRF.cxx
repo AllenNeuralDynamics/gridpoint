@@ -10,7 +10,7 @@
  *  The numeric routines below are the upstream implementations, lifted out of the
  *  LIMS-bound dispatcher class into free functions. The algorithm is unchanged; what
  *  changed is:
- *    - class members (image size, histogram bins, sample count, intensity maxima,
+ *    - class members (image size, sample count,
  *      metric outputs) became an explicit MrfContext passed by reference;
  *    - `delete x;` on array allocations became `delete[] x;` (the originals were
  *      undefined behaviour);
@@ -66,10 +66,7 @@ struct MrfContext
   vidx         sizeX{ 0 };
   vidx         sizeY{ 0 };
   vidx         sizeZ{ 0 };
-  unsigned int numBin{ 32 };
   int          sampleNum{ 1024 };
-  float        maxFixed{ 255.0f };
-  float        maxMoving{ 255.0f };
   float        metricBefore{ 0.0f };
   float        metricAfter{ 0.0f };
 };
@@ -366,9 +363,56 @@ parallelFor(vidx count, Body body)
             }
         }
 
+        /** Where interpolate3d gets its sampling coordinates.
+         *
+         *  Upstream always materialized three full-size float arrays, one per axis, even
+         *  where every entry was just the output index over a constant. On the subpixel
+         *  level those arrays are each eight times the volume -- 96 bytes per voxel of
+         *  stored index arithmetic, and measurement puts the deformable stage's peak
+         *  resident set inside exactly that allocation.
+         *
+         *  `Derived` computes x1 = j/xdiv, y1 = i/ydiv, z1 = k/zdiv in the loop instead.
+         *  The arrays held float, the divisors are float, and the operands and order are
+         *  unchanged, so each value is the same float that would have been stored and
+         *  read back. Results are bit-identical, which the test suite checks.
+         */
+        struct InterpGrid
+        {
+            const float* x{ nullptr };
+            const float* y{ nullptr };
+            const float* z{ nullptr };
+            float        xdiv{ 1.0f };
+            float        ydiv{ 1.0f };
+            float        zdiv{ 1.0f };
+
+            static InterpGrid Explicit(const float* x1, const float* y1, const float* z1)
+            {
+                InterpGrid g;
+                g.x = x1; g.y = y1; g.z = z1;
+                return g;
+            }
+
+            static InterpGrid Derived(float xdiv, float ydiv, float zdiv)
+            {
+                InterpGrid g;
+                g.xdiv = xdiv; g.ydiv = ydiv; g.zdiv = zdiv;
+                return g;
+            }
+        };
+
         void
-        interpolate3d(float* interp, float* input, float* x1, float* y1, float* z1, vidx xsize, vidx ysize, vidx zsize, vidx xsizenew, vidx ysizenew, vidx zsizenew, bool flag) {
+        interpolate3dGrid(float* interp, const float* input, const InterpGrid& grid, vidx xsize, vidx ysize, vidx zsize, vidx xsizenew, vidx ysizenew, vidx zsizenew, bool flag) {
             using namespace std;
+
+            const bool derived = (grid.x == nullptr);
+
+            // The y coordinate is the only one that varies along a row, and it repeats
+            // for every row, so one pass of xsize divides replaces one per voxel.
+            std::vector<float> yCoord;
+            if (derived) {
+                yCoord.resize(static_cast<size_t>(xsize));
+                for (vidx i = 0; i < xsize; i++) { yCoord[i] = (float) i / grid.ydiv; }
+            }
 
             // Output rows are independent, and there are ysize*zsize of them -- ample
             // parallel width even on a coarse control grid.
@@ -377,13 +421,21 @@ parallelFor(vidx count, Body body)
                 for (vidx r = rowBegin; r < rowEnd; r++) {
                     const vidx k = r / ysize;
                     const vidx j = r - k * ysize;
+                    // Constant down the row when the grid is derived; hoisted so only the
+                    // y coordinate costs a divide per voxel.
+                    const float rowX = derived ? (float) j / grid.xdiv : 0.0f;
+                    const float rowZ = derived ? (float) k / grid.zdiv : 0.0f;
                     for (vidx i = 0; i < xsize; i++) {
-                        vidx x = (vidx) floor(x1[i + j * xsize + k * xsize * ysize]);
-                        vidx y = (vidx) floor(y1[i + j * xsize + k * xsize * ysize]);
-                        vidx z = (vidx) floor(z1[i + j * xsize + k * xsize * ysize]);
-                        float deltax = x1[i + j * xsize + k * xsize * ysize] - x;
-                        float deltay = y1[i + j * xsize + k * xsize * ysize] - y;
-                        float deltaz = z1[i + j * xsize + k * xsize * ysize] - z;
+                        const vidx gi = i + j * xsize + k * xsize * ysize;
+                        const float cx = derived ? rowX : grid.x[gi];
+                        const float cy = derived ? yCoord[static_cast<size_t>(i)] : grid.y[gi];
+                        const float cz = derived ? rowZ : grid.z[gi];
+                        vidx x = (vidx) floor(cx);
+                        vidx y = (vidx) floor(cy);
+                        vidx z = (vidx) floor(cz);
+                        float deltax = cx - x;
+                        float deltay = cy - y;
+                        float deltaz = cz - z;
 
                         if (flag) {
                             x += j;
@@ -404,6 +456,12 @@ parallelFor(vidx count, Body body)
         }
 
         void
+        interpolate3d(float* interp, const float* input, const float* x1, const float* y1, const float* z1, vidx xsize, vidx ysize, vidx zsize, vidx xsizenew, vidx ysizenew, vidx zsizenew, bool flag) {
+            interpolate3dGrid(interp, input, InterpGrid::Explicit(x1, y1, z1),
+                              xsize, ysize, zsize, xsizenew, ysizenew, zsizenew, flag);
+        }
+
+        void
         InterpDeformationFld(float* fldx_in, float* fldy_in, float* fldz_in, float* fldx, float* fldy, float* fldz, vidx xsize_in, vidx ysize_in, vidx zsize_in, vidx xsize, vidx ysize, vidx zsize) {
 
 
@@ -411,29 +469,13 @@ parallelFor(vidx count, Body body)
             float scale_n = (float) ysize_in / (float) ysize;
             float scale_o = (float) zsize_in / (float) zsize;
 
-            float* x1 = new float[xsize_in * ysize_in * zsize_in];
-            float* y1 = new float[xsize_in * ysize_in * zsize_in];
-            float* z1 = new float[xsize_in * ysize_in * zsize_in];
-            const vidx fillRows = ysize_in * zsize_in;
-            parallelFor(fillRows, [&](vidx rowBegin, vidx rowEnd) {
-                for (vidx r = rowBegin; r < rowEnd; r++) {
-                    const vidx k = r / ysize_in;
-                    const vidx j = r - k * ysize_in;
-                    for (vidx i = 0; i < xsize_in; i++) {
-                        x1[i + j * xsize_in + k * xsize_in * ysize_in] = j / scale_n;
-                        y1[i + j * xsize_in + k * xsize_in * ysize_in] = i / scale_m;
-                        z1[i + j * xsize_in + k * xsize_in * ysize_in] = k / scale_o;
-                    }
-                }
-            });
+            // j/scale_n, i/scale_m, k/scale_o -- derived in the loop rather than stored
+            // three times over at full resolution.
+            const InterpGrid grid = InterpGrid::Derived(scale_n, scale_m, scale_o);
 
-            interpolate3d(fldx_in, fldx, x1, y1, z1, xsize_in, ysize_in, zsize_in, xsize, ysize, zsize, false);
-            interpolate3d(fldy_in, fldy, x1, y1, z1, xsize_in, ysize_in, zsize_in, xsize, ysize, zsize, false);
-            interpolate3d(fldz_in, fldz, x1, y1, z1, xsize_in, ysize_in, zsize_in, xsize, ysize, zsize, false);
-
-            delete []x1;
-            delete []y1;
-            delete []z1;
+            interpolate3dGrid(fldx_in, fldx, grid, xsize_in, ysize_in, zsize_in, xsize, ysize, zsize, false);
+            interpolate3dGrid(fldy_in, fldy, grid, xsize_in, ysize_in, zsize_in, xsize, ysize, zsize, false);
+            interpolate3dGrid(fldz_in, fldz, grid, xsize_in, ysize_in, zsize_in, xsize, ysize, zsize, false);
 
         }
 
@@ -795,8 +837,7 @@ parallelFor(vidx count, Body body)
         optimization(MrfContext & ctx, float* imgFix, float* imgMov, float* energy, float lambda, int hw, float gridstep, float mingrid, const unsigned char* activeNodes) {
             using namespace std;
 
-            float* fixed;
-            float* moving = imgMov;
+            const float* moving = imgMov;
 
             bool subpixel = false;
             if (mingrid == 0.5)
@@ -838,12 +879,15 @@ parallelFor(vidx count, Body body)
             else
                 hw_local = hw * (int) mingrid;
 
-            float* movingi;
-            int* movingiInd; //array of the index of bin for the histgram computing
-            int* fixedInd;
-
-            const float binSizeFixed = ctx.maxFixed / ctx.numBin;
-            const float binSizeMoving = ctx.maxMoving / ctx.numBin;
+            // The deformable stage scores with NCC, not mutual information. Upstream
+            // allocated a histogram-bin index per voxel for each image (fixedInd,
+            // movingiInd) and a private copy of each image, then never read any of it:
+            // 16 bytes per voxel and three full-volume passes per call, for nothing.
+            // `fixed` and `movingi` now alias the caller's buffers; only the subpixel
+            // path, which genuinely resamples, still allocates.
+            const float* fixed = imgFix;
+            const float* movingi = nullptr;
+            bool movingiOwned = false;
 
             vidx mi = m;
             vidx ni = n;
@@ -855,24 +899,15 @@ parallelFor(vidx count, Body body)
                 ni *= 2;
                 oi *= 2;
                 vidx szi = mi*ni*oi;
-                float* x1 = new float[szi];
-                float* y1 = new float[szi];
-                float* z1 = new float[szi];
-                movingi = new float[szi];
-                movingiInd = new int[szi];
-                for (int k = 0; k < oi; k++) {
-                    for (int j = 0; j < ni; j++) {
-                        for (int i = 0; i < mi; i++) {
-                            x1[i + j * mi + k * mi * ni] = 0.5 * (float) j;
-                            y1[i + j * mi + k * mi * ni] = 0.5 * (float) i;
-                            z1[i + j * mi + k * mi * ni] = 0.5 * (float) k;
-                        }
-                    }
-                }
-                interpolate3d(movingi, moving, x1, y1, z1, mi, ni, oi, m, n, o, false);
-                delete []x1;
-                delete []y1;
-                delete []z1;
+                float* movingiBuf = new float[szi];
+                movingi = movingiBuf;
+                movingiOwned = true;
+                // Sampling coordinates were 0.5*index on each axis, stored in three
+                // arrays of szi floats -- 96 bytes per input voxel, the largest live
+                // allocation anywhere in the stage. Dividing by 2 in the loop gives the
+                // identical float without any of them.
+                interpolate3dGrid(movingiBuf, moving, InterpGrid::Derived(2.0f, 2.0f, 2.0f),
+                                  mi, ni, oi, m, n, o, false);
                 for (int i = 0; i < lengthfull; i++) {
                     xs[i] *= 2.0;
                     ys[i] *= 2.0;
@@ -881,21 +916,8 @@ parallelFor(vidx count, Body body)
 
 
             } else {
-                movingi = new float[sz];
-                movingiInd = new int[sz];
-                for (vidx i = 0; i < sz; i++) {
-                    movingi[i] = moving[i];
-                }
-
-
-            }
-
-            fixed = new float[m * n * o];
-            fixedInd = new int[m * n * o];
-            for (vidx i = 0; i < m * n * o; i++) {
-
-                fixed[i] = imgFix[i];
-                fixedInd[i] = (int) floor(fixed[i] / binSizeFixed);
+                // Identical sampling grid, so the copy was pure overhead.
+                movingi = moving;
             }
 
             // The label offsets xs/ys/zs are fixed for the whole call, and in subpixel mode
@@ -1051,10 +1073,7 @@ parallelFor(vidx count, Body body)
                 });
             }
 
-            delete []movingi;
-            delete []fixed;
-            delete []movingiInd;
-            delete []fixedInd;
+            if (movingiOwned) { delete []movingi; }
 
             delete []xs;
             delete []ys;
@@ -1284,7 +1303,7 @@ EstimateDeformablePeakBytes(int sizeX, int sizeY, int sizeZ, const DeformablePar
     samples = std::max(64LL, samples / 4);
   }
 
-  return 190LL * vox + worstLevel + 20LL * 1024 * 1024;
+  return 85LL * vox + worstLevel + 20LL * 1024 * 1024;
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,20 +1323,7 @@ RunDeformableRegistration(const float *                imgFixIn,
   ctx.sizeX = sizeX;
   ctx.sizeY = sizeY;
   ctx.sizeZ = sizeZ;
-  ctx.numBin = params.numBin;
   ctx.sampleNum = params.sampleNum;
-
-  // Upstream assumes 8-bit data and hard-codes 255 here. Derive the real maxima so the
-  // similarity histogram bins correctly whatever the input range is.
-  ctx.maxFixed = 0.0f;
-  ctx.maxMoving = 0.0f;
-  for (vidx i = 0; i < volsize; ++i)
-  {
-    ctx.maxFixed = max(ctx.maxFixed, imgFixIn[i]);
-    ctx.maxMoving = max(ctx.maxMoving, imgMovIn[i]);
-  }
-  if (ctx.maxFixed <= 0.0f) { ctx.maxFixed = 1.0f; }
-  if (ctx.maxMoving <= 0.0f) { ctx.maxMoving = 1.0f; }
 
   // Coarse-to-fine control-grid spacings: 30, 15, 8, 4 upstream (ceil-halving).
   // Cap the starting spacing so the coarsest grid still has several nodes per axis;
