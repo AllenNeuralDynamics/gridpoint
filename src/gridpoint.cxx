@@ -287,14 +287,20 @@ main(int argc, char * argv[])
                                                                    static_cast<int>(fixedSize[2]),
                                                                    defParams);
       const long long voxels = static_cast<long long>(fixedSize[0]) * fixedSize[1] * fixedSize[2];
+      // Each mask is rasterized onto the fixed grid as one byte per voxel and held for
+      // the whole stage. The estimator itself only knows about image size, so the
+      // driver adds what it alone can see.
+      long long maskBytes = 0;
+      if (!fixedMaskPath.empty()) { maskBytes += voxels; }
+      if (!movingMaskPath.empty()) { maskBytes += voxels; }
       std::cout << "deformable stage: " << voxels << " voxels (" << fixedSize[0] << "x"
                 << fixedSize[1] << "x" << fixedSize[2] << "), estimated peak "
-                << HumanBytes(estimate) << std::endl;
+                << HumanBytes(estimate + maskBytes) << std::endl;
 
       itksys::SystemInformation sysInfo;
       sysInfo.RunMemoryCheck();
       const long long physical = static_cast<long long>(sysInfo.GetTotalPhysicalMemory()) * 1024 * 1024;
-      if (physical > 0 && estimate > physical)
+      if (physical > 0 && estimate + maskBytes > physical)
       {
         std::cerr << std::endl;
         std::cerr << "WARNING: the estimate above exceeds this machine's physical memory ("

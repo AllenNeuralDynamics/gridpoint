@@ -95,10 +95,10 @@ Run `gridpoint --help` for the full list. Common options:
 | Option | Meaning |
 |---|---|
 | `--stages rigid,affine` | which stages to run |
-| `--fixed-mask` / `--moving-mask` | metric masks |
+| `--fixed-mask` / `--moving-mask` | metric masks, see [Masking](#masking) |
 | `--threads N` | thread cap |
 | `--levels N` | multi-resolution levels (default 4 ⇒ shrink 8,4,2,1) |
-| `--bins`, `--linear-samples`, `--linear-iterations` | linear mutual-information knobs |
+| `--bins`, `--linear-samples`, `--linear-iterations` | linear mutual-information knobs (linear stages only) |
 | `--grid 30,15,8,4` | deformable control-grid schedule, voxels (coarsest first) |
 | `--lambda 1e-5` | deformable smoothness weight |
 | `--samples 1024` | deformable random samples per node |
@@ -106,6 +106,52 @@ Run `gridpoint --help` for the full list. Common options:
 | `--translation-scale`, `--max-step`, `--min-step` | optimizer scaling (auto by default) |
 | `--upstream-optimizer` | use the original Allen constants verbatim |
 | `--warped-ext .nii` | warped-image extension (default `.nii.gz`) |
+
+## Masking
+
+`--fixed-mask` and `--moving-mask` take `unsigned char` images, non-zero meaning inside,
+interpreted in physical space -- they need correct origin/spacing/direction but do not
+have to share the image's grid. They restrict **both** the linear and the deformable
+stages, but they do so in different ways, and the difference matters.
+
+**Linear stages.** The masks are handed to the Mattes mutual-information metric
+(`SetFixedImageMask` / `SetMovingImageMask`), restricting where it is evaluated. This is
+the same concept as the ANTs `-x [fixedMask,movingMask]` option.
+
+**Deformable stage.** Masking is applied to the *control grid*. A node whose cell holds
+no in-mask voxel is given a flat zero data cost, so the regularizer alone places it.
+
+Two consequences worth understanding:
+
+- **Masked-out regions are not held still.** Their displacement is a smooth
+  extrapolation from the masked-in neighbourhood. That is usually what is wanted, but
+  it is not zero, and it is not "the mask is a hard boundary".
+- **It is per node, not per sample.** A cell that straddles the mask edge is included
+  whole, so the effective boundary is quantized to the control-grid spacing of each
+  level -- 30 voxels at the coarsest default level, 4 at the finest. Sample-level
+  rejection would be sharper, but would leave different candidate displacements with
+  different numbers of valid samples, biasing the correlation between them.
+
+The moving mask is carried through the linear transform before use, because the
+deformable stage sees the moving image only after that transform has resampled it onto
+the fixed grid. It is then re-displaced by the deformation field at every pyramid level,
+so the mask follows the image as the alignment improves -- and in the backward half of
+the symmetric optimization the roles swap, the fixed mask being displaced by the inverse
+field.
+
+A masked run is also **faster**: a skipped node skips the sampling loop, which is the
+most expensive step in the stage. Expect the saving to concentrate at the fine levels;
+a coarse cell is 30^3 voxels and usually clips the mask somewhere.
+
+Run with `-v` to see how much of the grid is actually live:
+
+```
+  deformable: fixed mask covers 26.8% of the volume
+    active control nodes: forward 2304/4096, backward 2048/4096
+```
+
+Note that `--bins` has no effect on the deformable stage; it is a linear-stage knob
+only. The deformable stage uses normalized cross-correlation, not mutual information.
 
 Outputs, written into `out_dir`:
 

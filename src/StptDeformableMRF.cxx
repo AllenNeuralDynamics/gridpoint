@@ -1236,6 +1236,9 @@ EstimateDeformablePeakBytes(int sizeX, int sizeY, int sizeZ, const DeformablePar
   long long worstLevel = 0;
   int       step = params.gridStart > 0 ? params.gridStart : 1;
   int       previous = 0;
+  // Mirrors ctx.sampleNum, which RunDeformableRegistration quarters (floor 64) at the
+  // end of every level.
+  long long samples = std::max(0, params.sampleNum);
   for (int level = 0; level < params.numLevels; ++level)
   {
     if (level > 0)
@@ -1251,7 +1254,26 @@ EstimateDeformablePeakBytes(int sizeX, int sizeY, int sizeZ, const DeformablePar
                             std::max(1LL, static_cast<long long>(sizeY / step)) *
                             std::max(1LL, static_cast<long long>(sizeZ / step));
     // forward + backward cost volume, float each
-    worstLevel = std::max(worstLevel, 2LL * 4LL * nodes * labels);
+    const long long costVolumes = 2LL * 4LL * nodes * labels;
+
+    // optimization() draws its sample indices up front, so that the parallel node loop
+    // reproduces the serial rand() sequence exactly. Only in random mode, i.e. when the
+    // sample count is smaller than the grid cell the samples are drawn from.
+    const long long cell = static_cast<long long>(step) * step * step;
+    const long long sampleIdx = (samples < cell) ? nodes * samples * 4LL : 0LL;
+
+    // genDfm() holds one tile of same-depth energies, capped at 512 MiB and never more
+    // than a whole level's worth. It does not overlap sampleIdx in time: optimization()
+    // has returned before genDfm() is entered.
+    const long long tileEnergy = std::min(512LL * 1024 * 1024, 4LL * nodes * labels);
+
+    // Depth and level bookkeeping in genDfm().
+    const long long depthBytes = nodes * 4LL;
+
+    worstLevel =
+      std::max(worstLevel, costVolumes + std::max(sampleIdx, tileEnergy) + depthBytes);
+
+    samples = std::max(64LL, samples / 4);
   }
 
   return 190LL * vox + worstLevel + 20LL * 1024 * 1024;
