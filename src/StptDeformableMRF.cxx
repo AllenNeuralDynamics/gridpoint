@@ -787,7 +787,7 @@ parallelFor(vidx count, Body body)
         }
 
         void
-        optimization(MrfContext & ctx, float* imgFix, float* imgMov, float* energy, float lambda, int hw, float gridstep, float mingrid) {
+        optimization(MrfContext & ctx, float* imgFix, float* imgMov, float* energy, float lambda, int hw, float gridstep, float mingrid, const unsigned char* activeNodes) {
             using namespace std;
 
             float* fixed;
@@ -968,6 +968,17 @@ parallelFor(vidx count, Body body)
                     }
 
 
+                    // Grid masking. A node with no evidence behind it -- nothing in
+                    // mask on either side, after the current field has been applied to
+                    // the warped one -- gets a flat zero data cost, so the regularizer
+                    // alone places it. Skipping the sampling loop is also where the
+                    // speedup comes from: that loop is the most expensive thing here.
+                    if (activeNodes != nullptr && activeNodes[i] == 0) {
+                        std::fill(energy + i * lengthfull,
+                                  energy + (i + 1) * lengthfull, 0.0f);
+                        continue;
+                    }
+
                     // normalizerA was an array indexed by label, but what it accumulates --
                     // the squared fixed-image intensity -- has no label dependence whatsoever,
                     // so every entry held the same number. One scalar replaces the array, and
@@ -1104,6 +1115,110 @@ parallelFor(vidx count, Body body)
             ctx.metricAfter = metric;
         }
 
+// ---------------------------------------------------------------------------
+// Per-node mask for one direction of the symmetric optimization.
+//
+// optimization() compares an image that stays put against one that has been warped by
+// the current field, so the two masks cannot be treated alike: the mask belonging to the
+// warped image has to move with it, and by a different amount at every level.
+//
+// Rather than warp full-resolution mask volumes per level -- two of them at 4 bytes a
+// voxel is ~19 GB at CCF 10um -- the field is sampled once at each cell centre and the
+// cell scan is offset by it. The decision being made is per cell, so that is the
+// granularity the displacement is needed at.
+//
+// `maskSelf` belongs to the image passed as optimization()'s imgFix, which is not warped;
+// `maskOther` to the one passed as imgMov, which is warped by fldx/fldy/fldz. Either may
+// be null, meaning no restriction from that side. If both are null the output is cleared
+// and the caller reads that as no masking at all.
+// ---------------------------------------------------------------------------
+void
+ComputeActiveNodes(const MrfContext &           ctx,
+                   const unsigned char *        maskSelf,
+                   const unsigned char *        maskOther,
+                   const float *                fldx,
+                   const float *                fldy,
+                   const float *                fldz,
+                   float                        gridstep,
+                   std::vector<unsigned char> & active)
+{
+  if (maskSelf == nullptr && maskOther == nullptr)
+  {
+    active.clear();
+    return;
+  }
+
+  const vidx m = ctx.sizeX;
+  const vidx n = ctx.sizeY;
+  const vidx o = ctx.sizeZ;
+
+  // Mirror optimization()'s own grid arithmetic exactly, float division included, so that
+  // node i here is node i there.
+  const vidx gridx = static_cast<vidx>(m / gridstep);
+  const vidx gridy = static_cast<vidx>(n / gridstep);
+  const vidx gridz = static_cast<vidx>(o / gridstep);
+  const vidx nodes = gridx * gridy * gridz;
+  const vidx span = static_cast<vidx>(gridstep);
+
+  active.assign(static_cast<size_t>(nodes), 0);
+
+  parallelFor(nodes, [&](vidx nodeBegin, vidx nodeEnd) {
+    for (vidx i = nodeBegin; i < nodeEnd; i++)
+    {
+      vidx z1 = i / (gridx * gridy);
+      vidx x1 = (i - z1 * gridx * gridy) / gridx;
+      vidx y1 = i - z1 * gridx * gridy - x1 * gridx;
+      z1 = static_cast<vidx>(z1 * gridstep);
+      x1 = static_cast<vidx>(x1 * gridstep);
+      y1 = static_cast<vidx>(y1 * gridstep);
+
+      // One field lookup, at the cell centre. interpolate3d adds the y component to the
+      // fastest index and the x component to the next one; this follows that convention
+      // rather than the component names, which are transposed relative to the layout.
+      vidx dy = 0;
+      vidx dx = 0;
+      vidx dz = 0;
+      if (maskOther != nullptr)
+      {
+        const vidx cy = clampIdx(y1 + span / 2, m - 1);
+        const vidx cx = clampIdx(x1 + span / 2, n - 1);
+        const vidx cz = clampIdx(z1 + span / 2, o - 1);
+        const vidx c = cy + cx * m + cz * m * n;
+        dy = static_cast<vidx>(std::floor(fldy[c] + 0.5f));
+        dx = static_cast<vidx>(std::floor(fldx[c] + 0.5f));
+        dz = static_cast<vidx>(std::floor(fldz[c] + 0.5f));
+      }
+
+      bool selfInside = (maskSelf == nullptr);
+      bool otherInside = (maskOther == nullptr);
+      for (vidx kk = 0; kk < span && !(selfInside && otherInside); kk++)
+      {
+        const vidx zc = z1 + kk;
+        if (zc >= o) { break; }
+        for (vidx jj = 0; jj < span && !(selfInside && otherInside); jj++)
+        {
+          const vidx xc = x1 + jj;
+          if (xc >= n) { break; }
+          for (vidx ii = 0; ii < span; ii++)
+          {
+            const vidx yc = y1 + ii;
+            if (yc >= m) { break; }
+            if (!selfInside && maskSelf[yc + xc * m + zc * m * n] != 0) { selfInside = true; }
+            if (!otherInside && maskOther[clampIdx(yc + dy, m - 1) +
+                                          clampIdx(xc + dx, n - 1) * m +
+                                          clampIdx(zc + dz, o - 1) * m * n] != 0)
+            {
+              otherInside = true;
+            }
+            if (selfInside && otherInside) { break; }
+          }
+        }
+      }
+      active[static_cast<size_t>(i)] = (selfInside && otherInside) ? 1 : 0;
+    }
+  });
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -1149,7 +1264,9 @@ RunDeformableRegistration(const float *                imgFixIn,
                           int                          sizeX,
                           int                          sizeY,
                           int                          sizeZ,
-                          const DeformableParameters & params)
+                          const DeformableParameters & params,
+                          const unsigned char *        fixedMask,
+                          const unsigned char *        movingMask)
 {
   const vidx volsize = static_cast<vidx>(sizeX) * sizeY * sizeZ;
 
@@ -1281,11 +1398,35 @@ RunDeformableRegistration(const float *                imgFixIn,
     DfmfldModulation(ctx, imgMov.data(), optimizedBackward.data(), relationBackward.data(), stepsize);
 
     // Discrete label costs, then message passing along the tree.
+    // Re-derive the masked control grid for THIS level. The forward pass compares the
+    // fixed image against the moving image warped by the current field, so the moving
+    // mask is displaced by that field; the backward pass swaps both roles, because it
+    // genuinely treats the moving image as the one that stays put. Both change every
+    // level as the field grows, which is why this is not hoisted out of the loop.
+    std::vector<unsigned char> activeForward;
+    std::vector<unsigned char> activeBackward;
+    ComputeActiveNodes(ctx, fixedMask, movingMask, xfld.data(), yfld.data(), zfld.data(),
+                       static_cast<float>(stepsize), activeForward);
+    ComputeActiveNodes(ctx, movingMask, fixedMask, xfldinv.data(), yfldinv.data(),
+                       zfldinv.data(), static_cast<float>(stepsize), activeBackward);
+
+    if (params.verbose && !(activeForward.empty() && activeBackward.empty()))
+    {
+      const auto live = [](const std::vector<unsigned char> & v) {
+        return std::count_if(v.begin(), v.end(), [](unsigned char c) { return c != 0; });
+      };
+      std::cout << "    active control nodes: forward " << live(activeForward) << "/"
+                << activeForward.size() << ", backward " << live(activeBackward) << "/"
+                << activeBackward.size() << std::endl;
+    }
+
     if (params.verbose) { std::cerr << "      [step] cost (optimization)" << std::endl; }
     std::vector<float> costforward(static_cast<size_t>(volsizethis) * labelCount);
     std::vector<float> costbackward(static_cast<size_t>(volsizethis) * labelCount);
-    optimization(ctx, imgFix.data(), warpedImgFix.data(), costforward.data(), params.lambda, hwidth, stepsize, minsize);
-    optimization(ctx, imgMov.data(), warpedImgMov.data(), costbackward.data(), params.lambda, hwidth, stepsize, minsize);
+    optimization(ctx, imgFix.data(), warpedImgFix.data(), costforward.data(), params.lambda, hwidth, stepsize, minsize,
+                 activeForward.empty() ? nullptr : activeForward.data());
+    optimization(ctx, imgMov.data(), warpedImgMov.data(), costbackward.data(), params.lambda, hwidth, stepsize, minsize,
+                 activeBackward.empty() ? nullptr : activeBackward.data());
 
     if (params.verbose) { std::cerr << "      [step] genDfm" << std::endl; }
     genDfm(ctx, xlabel.data(), ylabel.data(), zlabel.data(),

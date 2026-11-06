@@ -78,14 +78,36 @@ EstimateDeformablePeakBytes(int sizeX, int sizeY, int sizeZ, const DeformablePar
  *
  *  `imgFix` and `imgMov` are x-fastest buffers of size sizeX*sizeY*sizeZ, already
  *  linearly aligned (run the rigid/affine stages first). The returned field maps fixed
- *  positions to moving positions, in voxels. */
+ *  positions to moving positions, in voxels.
+ *
+ *  `fixedMask` and `movingMask` are optional buffers of the same size and layout as
+ *  `imgFix`, non-zero meaning inside, both already on the fixed grid -- for the moving
+ *  mask that means the caller has carried it through the linear transform, since this
+ *  stage sees the moving image only after that transform resampled it.
+ *
+ *  They are kept separate rather than intersected by the caller because this stage
+ *  re-derives the masked control grid at every pyramid level: the moving mask is
+ *  displaced by the current field before being tested, and in the backward half of the
+ *  symmetric optimization the two swap roles, the fixed mask being displaced by the
+ *  inverse field. Intersecting them up front would freeze both at the linear
+ *  alignment. A control-grid node whose cell contains no in-mask
+ *  voxel is given a flat zero data cost, so the regularizer alone decides its
+ *  displacement and it follows its neighbours smoothly rather than chasing whatever lies
+ *  outside the mask. Such nodes stay in the graph, so the spanning tree cannot fragment,
+ *  and the field stays defined everywhere.
+ *
+ *  Note what this does NOT mean: masked-out regions are not held still. Their
+ *  displacement is a smooth extrapolation from the masked-in neighbourhood, which is
+ *  usually what is wanted, but it is not zero. */
 DeformableResult
 RunDeformableRegistration(const float *                imgFix,
                           const float *                imgMov,
                           int                          sizeX,
                           int                          sizeY,
                           int                          sizeZ,
-                          const DeformableParameters & params);
+                          const DeformableParameters & params,
+                          const unsigned char *        fixedMask = nullptr,
+                          const unsigned char *        movingMask = nullptr);
 
 } // namespace stpt
 

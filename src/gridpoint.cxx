@@ -20,6 +20,7 @@
 #include "itkImageFileReader.h"
 #include "itkImageFileWriter.h"
 #include "itkLinearInterpolateImageFunction.h"
+#include "itkNearestNeighborInterpolateImageFunction.h"
 #include "itkResampleImageFilter.h"
 #include "itkTransformFileWriter.h"
 
@@ -419,13 +420,72 @@ main(int argc, char * argv[])
       defParams.verbose = params.verbose;
       if (params.verbose) { std::cout << "stage: deformable (discrete MRF)" << std::endl; }
 
+      // Mask the control grid.
+      //
+      // A fixed-image mask lands on the grid directly. A moving-image mask has to be
+      // carried through the linear transform first, because the deformable stage sees
+      // the moving image only AFTER that transform resampled it onto the fixed grid --
+      // the mask has to make the same journey as the image it describes.
+      //
+      // The two are intersected into one buffer here, matching the ANTs rule that a
+      // sample counts only if it is valid in both images. Doing it in the driver means
+      // the MRF has to know about a single mask and its hot loop is untouched.
+      //
+      // Nearest neighbour throughout: a mask is a label image, not an intensity.
+      std::vector<unsigned char> gridMaskFixed;
+      std::vector<unsigned char> gridMaskMoving;
+      if (masks.fixedMask || masks.movingMask)
+      {
+        const itk::SizeValueType voxels = fixed->GetBufferedRegion().GetNumberOfPixels();
+
+        auto rasterize =
+          [&](const stpt::MaskSpatialObjectType *                             mask,
+              const itk::Transform<double, stpt::Dimension, stpt::Dimension> * toMaskSpace,
+              const char *                                                    label,
+              std::vector<unsigned char> &                                    out) {
+            using MaskResampleType =
+              itk::ResampleImageFilter<stpt::MaskImageType, stpt::MaskImageType>;
+            auto resampleMask = MaskResampleType::New();
+            resampleMask->SetInput(mask->GetImage());
+            resampleMask->SetInterpolator(
+              itk::NearestNeighborInterpolateImageFunction<stpt::MaskImageType, double>::New());
+            resampleMask->SetTransform(toMaskSpace);
+            resampleMask->SetOutputParametersFromImage(fixed);
+            resampleMask->SetDefaultPixelValue(0);
+            resampleMask->Update();
+            const unsigned char * rasterized = resampleMask->GetOutput()->GetBufferPointer();
+            out.assign(rasterized, rasterized + voxels);
+            if (params.verbose)
+            {
+              itk::SizeValueType inside = 0;
+              for (itk::SizeValueType v = 0; v < voxels; ++v) { inside += (out[v] != 0); }
+              std::cout << "  deformable: " << label << " mask covers "
+                        << (100.0 * static_cast<double>(inside) / static_cast<double>(voxels))
+                        << "% of the volume" << std::endl;
+            }
+          };
+
+        if (masks.fixedMask)
+        {
+          rasterize(masks.fixedMask, itk::IdentityTransform<double, stpt::Dimension>::New(),
+                    "fixed", gridMaskFixed);
+        }
+        if (masks.movingMask) { rasterize(masks.movingMask, finalTransform, "moving", gridMaskMoving); }
+      }
+
       const auto size = fixed->GetBufferedRegion().GetSize();
       deformable = stpt::RunDeformableRegistration(fixed->GetBufferPointer(),
                                                    linearWarped->GetBufferPointer(),
                                                    static_cast<int>(size[0]),
                                                    static_cast<int>(size[1]),
                                                    static_cast<int>(size[2]),
-                                                   defParams);
+                                                   defParams,
+                                                   gridMaskFixed.empty()
+                                                     ? nullptr
+                                                     : gridMaskFixed.data(),
+                                                   gridMaskMoving.empty()
+                                                     ? nullptr
+                                                     : gridMaskMoving.data());
       ranDeformable = true;
 
       // The algorithm already resampled the moving image; copy that out rather than
