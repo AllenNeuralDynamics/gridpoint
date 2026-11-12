@@ -1519,6 +1519,18 @@ RunDeformableRegistration(const float *                imgFixIn,
   result.invX.swap(yfldinv);
   result.invY.swap(xfldinv);
   result.invZ.swap(zfldinv);
+  // The generator of the two dense fields above. Same component transposition, for the
+  // same reason: these came off the same interpolate3d convention.
+  result.gridDispX.swap(ylabel);
+  result.gridDispY.swap(xlabel);
+  result.gridDispZ.swap(zlabel);
+  result.gridInvX.swap(ylabelinv);
+  result.gridInvY.swap(xlabelinv);
+  result.gridInvZ.swap(zlabelinv);
+  result.gridNx = xgridsize;
+  result.gridNy = ygridsize;
+  result.gridNz = zgridsize;
+  result.gridFinalUsed = gridSize[numLevels - 1];
   result.metricBefore = ctx.metricBefore;
   result.metricAfter = ctx.metricAfter;
   result.levelsUsed = numLevels;

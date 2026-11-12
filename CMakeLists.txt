@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(gridpoint VERSION 0.2.0 LANGUAGES C CXX)
+project(gridpoint VERSION 0.3.0 LANGUAGES C CXX)
 
 # Bake the version and the exact commit into the binary. Without this there is no way
 # to tell which build you are running: the Code Ocean postInstall clones, builds and

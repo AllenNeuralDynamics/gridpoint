@@ -102,7 +102,8 @@ Run `gridpoint --help` for the full list. Common options:
 | `--grid 30,15,8,4` | deformable control-grid schedule, voxels (coarsest first) |
 | `--lambda 1e-5` | deformable smoothness weight |
 | `--samples 1024` | deformable random samples per node |
-| `--write-deformation-field` | also write the dense displacement field |
+| `--write-deformation-field` | also write the displacement fields |
+| `--warp-resolution grid\|full` | which grid to write them on, see [Deformation fields](#deformation-fields) |
 | `--translation-scale`, `--max-step`, `--min-step` | optimizer scaling (auto by default) |
 | `--upstream-optimizer` | use the original Allen constants verbatim |
 | `--warped-ext .nii` | warped-image extension (default `.nii.gz`) |
@@ -176,6 +177,48 @@ Order matters — `antsApplyTransforms` applies `-t` right to left, so the affin
 listed *last*. Verified on a 96³ textured pair: that ordering reproduces gridpoint's own
 `stpt_Warped.nii.gz` to NCC 0.9990 (the residual is interpolation, not convention),
 while the reverse order gives 0.8992.
+
+### Deformation fields
+
+`--warp-resolution` chooses the grid the two fields are written on. **`grid` is the
+default.**
+
+Every level of the deformable stage accumulates at *control-grid* resolution -- `genDfm`,
+`smoothDfm` and `symmetricMapping` all operate on the control array -- and the dense
+field is produced by a single trilinear upsample at the end of the level. So the control
+grid is not a reduction of the field, it *is* the field; writing one vector per voxel
+writes every number `spacing^3` times over. At the default schedule the finest spacing is
+4, so that is 64x.
+
+| | 192³ phantom | 10 µm CCF (1320×800×1140) |
+|---|---|---|
+| `full` | 58 MB | ~12 GB |
+| `grid` | 0.87 MB | ~195 MB |
+
+ITK and ANTs read a displacement field through its origin, spacing and direction cosines
+and have never required it to share the reference image's grid, so the smaller file is a
+drop-in -- the `antsApplyTransforms` commands above are unchanged.
+
+Verified on a 192³ pair with a local sinusoidal warp:
+
+* the written grid field equals a stride-4 decimation of the dense field exactly
+  (`max|diff| = 0`), which is what makes it lossless rather than merely small;
+* `antsApplyTransforms` produces the same warped image from either, to `1.4e-06` on
+  intensities spanning 0 to 2.57 -- float rounding, not a difference in the transform;
+* `--warp-resolution full` is bit-identical to the pre-0.3.0 build at 1, 4 and 24 threads.
+
+The grid field carries one extra sample per axis, replicating the last. The control
+grid's own extent stops short of the fixed grid's by up to `spacing - 1` voxels, and ANTs
+pads with zero outside a field rather than clamping to its edge; without that sample the
+outer shell loses its displacement. The spacing is derived from the grid dimensions
+rather than assumed equal to the control spacing, because the core computes
+`nodes = size / spacing` with integer division -- when an axis length is not a multiple
+of the spacing, the true ratio is not the spacing.
+
+Use `full` when something downstream wants the dense array itself rather than a transform
+ANTs will resample. Note that anything which makes ANTs *write* a field --
+`antsApplyTransforms -o [composite.nii.gz,1]`, or a subsequent `antsRegistration` --
+emits it on the reference grid, so the compact form does not propagate.
 
 ### Going the other way
 

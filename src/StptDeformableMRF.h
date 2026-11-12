@@ -55,10 +55,25 @@ struct DeformableResult
   std::vector<float> invX;
   std::vector<float> invY;
   std::vector<float> invZ;
+  // The control grid the dense fields above were interpolated from: the final level's
+  // displacements, same VOXEL units and same x-fastest axis order, sized
+  // gridNx*gridNy*gridNz. Every level accumulates at this resolution and the dense
+  // field is produced by a single trilinear upsample at the end, so this is the whole
+  // of the field's information -- 1/gridFinalUsed^3 as many numbers, losslessly.
+  std::vector<float> gridDispX;
+  std::vector<float> gridDispY;
+  std::vector<float> gridDispZ;
+  std::vector<float> gridInvX;
+  std::vector<float> gridInvY;
+  std::vector<float> gridInvZ;
+  int                gridNx{ 0 };  // control-grid dimensions
+  int                gridNy{ 0 };
+  int                gridNz{ 0 };
   float              metricBefore{ 0.0f };  // mean squared difference before
   float              metricAfter{ 0.0f };   // ... and after
   int                levelsUsed{ 0 };
   int                gridStartUsed{ 0 };
+  int                gridFinalUsed{ 0 };    // finest control spacing actually used, voxels
 };
 
 /** Rough peak resident bytes for RunDeformableRegistration on this shape.

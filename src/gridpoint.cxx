@@ -83,7 +83,11 @@ PrintUsage(const char * argv0)
     << "  --lambda <x>                 deformable smoothness weight\n"
     << "  --samples <n>                deformable random samples\n"
     << "  --warped-ext <.ext>          warped image extension (default .nii.gz)\n"
-    << "  --write-deformation-field    also write the dense deformation fields\n"
+    << "  --write-deformation-field    also write the deformation fields\n"
+    << "  --warp-resolution grid|full  grid (default) writes the fields on the control\n"
+    << "                               grid they were interpolated from -- same field,\n"
+    << "                               spacing^3 fewer samples. full writes one vector\n"
+    << "                               per voxel.\n"
     << "  -v                           verbose\n"
     << "  --version                    print version and exit\n\n"
     << "Outputs, written into <out_dir>:\n"
@@ -159,6 +163,9 @@ main(int argc, char * argv[])
   std::string warpedExt = ".nii.gz";
   std::string gridText;
   bool        writeDeformationField = false;
+  // Default on. The dense field is a trilinear upsample of the control grid, so storing
+  // it per voxel stores every number spacing^3 times over -- 64x at the default schedule.
+  bool        warpAtGridSpacing = true;
   int         threads = 0;
 
   stpt::LinearParameters     params;
@@ -207,6 +214,18 @@ main(int argc, char * argv[])
       else if (arg == "--samples") { defParams.sampleNum = std::stoi(next("--samples")); }
       else if (arg == "--warped-ext") { warpedExt = next("--warped-ext"); }
       else if (arg == "--write-deformation-field") { writeDeformationField = true; }
+      else if (arg == "--warp-resolution")
+      {
+        const std::string value = next("--warp-resolution");
+        if (value == "grid") { warpAtGridSpacing = true; }
+        else if (value == "full") { warpAtGridSpacing = false; }
+        else
+        {
+          std::cerr << "error: --warp-resolution takes 'grid' or 'full', not '" << value
+                    << "'." << std::endl;
+          return EXIT_FAILURE;
+        }
+      }
       else if (arg == "-v") { params.verbose = true; }
       else if (arg == "-h" || arg == "--help") { PrintUsage(argv[0]); return EXIT_SUCCESS; }
       else if (arg == "--version") { std::cout << VersionString() << std::endl; return EXIT_SUCCESS; }
@@ -528,34 +547,44 @@ main(int argc, char * argv[])
         // Both fields go through this one helper so their conventions cannot drift
         // apart: voxel displacements -> physical, honouring spacing and direction
         // cosines, on the fixed grid.
-        auto writeField = [&](const std::vector<float> & compX,
-                              const std::vector<float> & compY,
-                              const std::vector<float> & compZ,
-                              const std::string &        path) {
+        // The displacement VALUES are in full-resolution voxel units whichever grid they
+        // are stored on, so the conversion to physical is the same in both cases: scale
+        // by the fixed image's spacing, then rotate by its direction cosines. Only the
+        // image geometry differs.
+        const auto fixedSpacing = fixed->GetSpacing();
+        const auto fixedDirection = fixed->GetDirection();
+        const auto fixedSize = fixed->GetBufferedRegion().GetSize();
+
+        auto toPhysical = [&](float dx, float dy, float dz) {
+          const double local[stpt::Dimension] = { dx * fixedSpacing[0],
+                                                  dy * fixedSpacing[1],
+                                                  dz * fixedSpacing[2] };
+          VectorType   v;
+          for (unsigned int r = 0; r < stpt::Dimension; ++r)
+          {
+            double acc = 0.0;
+            for (unsigned int c = 0; c < stpt::Dimension; ++c)
+            {
+              acc += fixedDirection[r][c] * local[c];
+            }
+            v[r] = static_cast<float>(acc);
+          }
+          return v;
+        };
+
+        // Dense: one vector per voxel of the fixed grid.
+        auto writeFieldFull = [&](const std::vector<float> & compX,
+                                  const std::vector<float> & compY,
+                                  const std::vector<float> & compZ,
+                                  const std::string &        path) {
           auto field = FieldType::New();
           field->CopyInformation(fixed);
           field->SetRegions(fixed->GetBufferedRegion());
           field->Allocate();
-
-          const auto   spacing = fixed->GetSpacing();
-          const auto   direction = fixed->GetDirection();
           VectorType * out = field->GetBufferPointer();
           for (size_t i = 0; i < compX.size(); ++i)
           {
-            const double local[stpt::Dimension] = { compX[i] * spacing[0],
-                                                    compY[i] * spacing[1],
-                                                    compZ[i] * spacing[2] };
-            VectorType   v;
-            for (unsigned int r = 0; r < stpt::Dimension; ++r)
-            {
-              double acc = 0.0;
-              for (unsigned int c = 0; c < stpt::Dimension; ++c)
-              {
-                acc += direction[r][c] * local[c];
-              }
-              v[r] = static_cast<float>(acc);
-            }
-            out[i] = v;
+            out[i] = toPhysical(compX[i], compY[i], compZ[i]);
           }
 
           auto fieldWriter = itk::ImageFileWriter<FieldType>::New();
@@ -565,12 +594,103 @@ main(int argc, char * argv[])
           if (params.verbose) { std::cout << "wrote " << path << std::endl; }
         };
 
-        writeField(deformable.dispX, deformable.dispY, deformable.dispZ,
-                   outDir + "/stpt_Warp.nii.gz");
-        // The backward half of the symmetric optimization, for mapping fixed-space data
-        // (atlas labels, point sets) back onto the moving image.
-        writeField(deformable.invX, deformable.invY, deformable.invZ,
-                   outDir + "/stpt_InverseWarp.nii.gz");
+        // Control grid: the array the dense field was interpolated from, written with a
+        // correspondingly coarser spacing so it means the same thing in physical space.
+        // ITK and ANTs read a displacement field through its origin/spacing/direction and
+        // have never required it to share the reference image's grid, so this is a
+        // drop-in -- and it is the whole of the field's information, not a reduction of
+        // it. One extra sample per axis, replicating the last, because the control grid's
+        // own extent stops short of the fixed grid's by up to (spacing - 1) voxels and
+        // ANTs pads with zero outside a field rather than clamping to its edge.
+        auto writeFieldGrid = [&](const std::vector<float> & compX,
+                                  const std::vector<float> & compY,
+                                  const std::vector<float> & compZ,
+                                  const std::string &        path) {
+          const int nx = deformable.gridNx;
+          const int ny = deformable.gridNy;
+          const int nz = deformable.gridNz;
+
+          FieldType::SizeType size;
+          size[0] = static_cast<itk::SizeValueType>(nx) + 1;
+          size[1] = static_cast<itk::SizeValueType>(ny) + 1;
+          size[2] = static_cast<itk::SizeValueType>(nz) + 1;
+
+          // Derived from the dimensions rather than assumed to be the grid spacing: the
+          // core computes nx = sizeX / spacing with integer division, so when the axis
+          // length is not a multiple of the spacing the true ratio is not the spacing.
+          const double scale[stpt::Dimension] = {
+            static_cast<double>(fixedSize[0]) / static_cast<double>(nx),
+            static_cast<double>(fixedSize[1]) / static_cast<double>(ny),
+            static_cast<double>(fixedSize[2]) / static_cast<double>(nz)
+          };
+
+          FieldType::SpacingType coarseSpacing;
+          for (unsigned int d = 0; d < stpt::Dimension; ++d)
+          {
+            coarseSpacing[d] = fixedSpacing[d] * scale[d];
+          }
+
+          auto field = FieldType::New();
+          field->SetRegions(FieldType::RegionType(size));
+          field->SetSpacing(coarseSpacing);
+          field->SetOrigin(fixed->GetOrigin());
+          field->SetDirection(fixedDirection);
+          field->Allocate();
+
+          VectorType * out = field->GetBufferPointer();
+          for (itk::SizeValueType k = 0; k < size[2]; ++k)
+          {
+            const size_t ks = static_cast<size_t>(std::min<itk::SizeValueType>(k, nz - 1));
+            for (itk::SizeValueType j = 0; j < size[1]; ++j)
+            {
+              const size_t js = static_cast<size_t>(std::min<itk::SizeValueType>(j, ny - 1));
+              for (itk::SizeValueType i = 0; i < size[0]; ++i)
+              {
+                const size_t is = static_cast<size_t>(std::min<itk::SizeValueType>(i, nx - 1));
+                const size_t src = is + js * static_cast<size_t>(nx)
+                                   + ks * static_cast<size_t>(nx) * static_cast<size_t>(ny);
+                const size_t dst = i + j * size[0] + k * size[0] * size[1];
+                out[dst] = toPhysical(compX[src], compY[src], compZ[src]);
+              }
+            }
+          }
+
+          auto fieldWriter = itk::ImageFileWriter<FieldType>::New();
+          fieldWriter->SetFileName(path);
+          fieldWriter->SetInput(field);
+          fieldWriter->Update();
+          if (params.verbose)
+          {
+            std::cout << "wrote " << path << " (" << size[0] << "x" << size[1] << "x"
+                      << size[2] << ", control spacing " << deformable.gridFinalUsed
+                      << " voxels)" << std::endl;
+          }
+        };
+
+        const bool haveGrid = !deformable.gridDispX.empty() && deformable.gridNx > 0 &&
+                              deformable.gridNy > 0 && deformable.gridNz > 0;
+        if (warpAtGridSpacing && !haveGrid)
+        {
+          std::cerr << "warning: no control grid was returned; writing the dense field."
+                    << std::endl;
+        }
+
+        if (warpAtGridSpacing && haveGrid)
+        {
+          writeFieldGrid(deformable.gridDispX, deformable.gridDispY, deformable.gridDispZ,
+                         outDir + "/stpt_Warp.nii.gz");
+          // The backward half of the symmetric optimization, for mapping fixed-space data
+          // (atlas labels, point sets) back onto the moving image.
+          writeFieldGrid(deformable.gridInvX, deformable.gridInvY, deformable.gridInvZ,
+                         outDir + "/stpt_InverseWarp.nii.gz");
+        }
+        else
+        {
+          writeFieldFull(deformable.dispX, deformable.dispY, deformable.dispZ,
+                         outDir + "/stpt_Warp.nii.gz");
+          writeFieldFull(deformable.invX, deformable.invY, deformable.invZ,
+                         outDir + "/stpt_InverseWarp.nii.gz");
+        }
       }
     }
 
