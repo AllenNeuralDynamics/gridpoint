@@ -921,17 +921,31 @@ parallelFor(vidx count, Body body)
             }
 
             // The label offsets xs/ys/zs are fixed for the whole call, and in subpixel mode
-            // already carry the x2 scaling applied above. Fold each label's three offsets into
-            // a single flat buffer offset so the interior case below costs one add per label
-            // instead of three float-to-int conversions and two multiplies.
-            std::vector<int>  xsi(lengthfull), ysi(lengthfull), zsi(lengthfull);
-            std::vector<vidx> labelOffset(lengthfull);
-            for (int l = 0; l < lengthfull; l++) {
-                xsi[l] = (int) xs[l];
-                ysi[l] = (int) ys[l];
-                zsi[l] = (int) zs[l];
-                labelOffset[l] = static_cast<vidx>(ysi[l]) + static_cast<vidx>(xsi[l]) * mi
-                               + static_cast<vidx>(zsi[l]) * mi * ni;
+            // already carry the x2 scaling applied above.
+            //
+            // Each of the three depends on exactly ONE of the label index's three
+            // components -- label l is i + j*len + k*len*len, and xs varies only with j,
+            // ys only with i, zs only with k -- so the flat per-label arrays held len
+            // copies of every value. Three arrays of len replace three of len^3, and
+            // splitting the label loop into (k, j, i) below lets the innermost one walk
+            // a contiguous run of movingi instead of chasing a table of offsets.
+            //
+            // These are read off xs/ys/zs at the same positions the flat version used, so
+            // the float-to-int conversion is the identical one on the identical value.
+            std::vector<int> yOff(len), xOff(len), zOff(len);
+            for (int t = 0; t < len; t++) {
+                yOff[t] = (int) ys[t];                           // l = t
+                xOff[t] = (int) xs[static_cast<size_t>(t) * len];      // l = t*len
+                zOff[t] = (int) zs[static_cast<size_t>(t) * len * len]; // l = t*len*len
+            }
+
+            // Whether the innermost run is a unit stride in the buffer. It is for every
+            // schedule shipped (mingrid 1.0, and 0.5 paired with the subpixel doubling
+            // that cancels it), but the fast path below is gated on the actual numbers
+            // rather than on that argument, and a non-unit stride still works.
+            bool unitY = true;
+            for (int t = 0; t < len; t++) {
+                if (yOff[t] != yOff[0] + t) { unitY = false; break; }
             }
 
             int samples = ctx.sampleNum;
@@ -966,10 +980,32 @@ parallelFor(vidx count, Body body)
                 parallelFor(sz1, [&](vidx nodeBegin, vidx nodeEnd) {
 
                 // Scratch the serial version shared has to become per-chunk.
+                // Reference captures the vectorizer cannot prove invariant, pinned to
+                // locals. `len` is the innermost trip count, so this one line is the
+                // difference between a vector body and a scalar one.
+                //
+                // These are value copies only. __restrict deliberately does NOT appear
+                // here: the innermost `c`, `nb` and `mrow` below are derived from
+                // cost1/normalizerB/movingi_ and carry it themselves, and qualifying both
+                // levels promises the compiler that the buffers are reached only through
+                // the outer pointer when in fact they are reached through the inner one.
+                // MSVC acts on that promise, and the result stops matching the scalar
+                // build on any volume with genuine interior nodes.
+                const int  len_ = len;
+                const vidx mi_ = mi, ni_ = ni, oi_ = oi;
+                const int* const yOff_ = yOff.data();
+                const int* const xOff_ = xOff.data();
+                const int* const zOff_ = zOff.data();
+                const bool unitY_ = unitY;
+                const float* const movingi_ = movingi;
+
                 std::vector<float> cost1Buf(lengthfull), normBBuf(lengthfull);
                 float* cost1 = cost1Buf.data();
                 float* normalizerB = normBBuf.data();
-                vidx xind, yind, zind;
+                // Clamped y indices for one sample, reused across all len^2 (k, j) pairs
+                // of the boundary path: len clamps per sample rather than len^3.
+                std::vector<vidx> yClampBuf(len);
+                vidx* yClamp = yClampBuf.data();
 
                 for (vidx i = nodeBegin; i < nodeEnd; i++) {
                     vidx z1 = i / (static_cast<vidx>(gridx) * gridy);
@@ -1038,24 +1074,79 @@ parallelFor(vidx count, Body body)
                         const vidx by = subpixel ? yy * 2 : yy;
                         const vidx bz = subpixel ? zz * 2 : zz;
 
+                        // Label l is i + j*len + k*len*len. Visiting (k, j, i) instead of
+                        // flat l hoists the z and x index arithmetic out of the innermost
+                        // loop, which then walks i alone -- a stride-1 load and two
+                        // stride-1 accumulations, which is a shape the vectorizer takes.
+                        //
+                        // Every label still has its own accumulator and the sum over
+                        // samples is still the outer loop, so no addition is reordered and
+                        // the result is bit-identical to the flat version.
                         if (boundaries) {
-                            // Interior node: every label lands inside the volume, so both the
-                            // clamp and the per-label index arithmetic fall away and the moving
-                            // sample is one offset from a fixed base.
+                            // Interior node: every label lands inside the volume, so the
+                            // clamps fall away.
                             const vidx base = by + bx * mi + bz * mi * ni;
-                            for (int l = 0; l < lengthfull; l++) {
-                                const float mv = movingi[base + labelOffset[l]];
-                                cost1[l] += fv * mv;
-                                normalizerB[l] += mv * mv;
+                            if (unitY_) {
+                                for (int k2 = 0; k2 < len_; k2++) {
+                                    const vidx kb = base + static_cast<vidx>(zOff_[k2]) * mi_ * ni_
+                                                  + yOff_[0];
+                                    for (int j2 = 0; j2 < len_; j2++) {
+                                        const float* __restrict mrow =
+                                            movingi_ + kb + static_cast<vidx>(xOff_[j2]) * mi_;
+                                        float* __restrict c = cost1 + (j2 + k2 * len_) * len_;
+                                        float* __restrict nb =
+                                            normalizerB + (j2 + k2 * len_) * len_;
+                                        // The loop the whole restructure exists to
+                                        // produce: stride-1 load, two stride-1
+                                        // accumulations, trip count a local. Every
+                                        // compiler targeted here vectorizes it, and
+                                        // because each label owns its accumulator and
+                                        // the sum over samples is still the outer loop,
+                                        // the vector form adds in the same order as the
+                                        // scalar one and gives bit-identical results.
+                                        for (int i2 = 0; i2 < len_; i2++) {
+                                            const float mv = mrow[i2];
+                                            c[i2] += fv * mv;
+                                            nb[i2] += mv * mv;
+                                        }
+                                    }
+                                }
+                            } else {
+                                for (int k2 = 0; k2 < len_; k2++) {
+                                    const vidx kb = base + static_cast<vidx>(zOff_[k2]) * mi_ * ni_;
+                                    for (int j2 = 0; j2 < len_; j2++) {
+                                        const vidx xzb = kb + static_cast<vidx>(xOff_[j2]) * mi_;
+                                        float* __restrict c = cost1 + (j2 + k2 * len_) * len_;
+                                        float* __restrict nb =
+                                            normalizerB + (j2 + k2 * len_) * len_;
+                                        for (int i2 = 0; i2 < len_; i2++) {
+                                            const float mv = movingi_[xzb + yOff_[i2]];
+                                            c[i2] += fv * mv;
+                                            nb[i2] += mv * mv;
+                                        }
+                                    }
+                                }
                             }
                         } else {
-                            for (int l = 0; l < lengthfull; l++) {
-                                xind = clampIdx(bx + xsi[l], ni - 1);
-                                yind = clampIdx(by + ysi[l], mi - 1);
-                                zind = clampIdx(bz + zsi[l], oi - 1);
-                                const float mv = movingi[yind + xind * mi + zind * mi * ni];
-                                cost1[l] += fv * mv;
-                                normalizerB[l] += mv * mv;
+                            // Edge node: each clamp depends on one axis only, so the y row
+                            // is computed once per sample and x and z once per (k, j).
+                            for (int i2 = 0; i2 < len_; i2++) {
+                                yClamp[i2] = clampIdx(by + yOff_[i2], mi_ - 1);
+                            }
+                            for (int k2 = 0; k2 < len_; k2++) {
+                                const vidx zb = clampIdx(bz + zOff_[k2], oi_ - 1) * mi_ * ni_;
+                                for (int j2 = 0; j2 < len_; j2++) {
+                                    const vidx xzb =
+                                        zb + clampIdx(bx + xOff_[j2], ni_ - 1) * mi_;
+                                    float* __restrict c = cost1 + (j2 + k2 * len_) * len_;
+                                    float* __restrict nb =
+                                        normalizerB + (j2 + k2 * len_) * len_;
+                                    for (int i2 = 0; i2 < len_; i2++) {
+                                        const float mv = movingi_[xzb + yClamp[i2]];
+                                        c[i2] += fv * mv;
+                                        nb[i2] += mv * mv;
+                                    }
+                                }
                             }
                         }
                     }
