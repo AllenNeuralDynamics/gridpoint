@@ -67,6 +67,7 @@ struct MrfContext
   vidx         sizeY{ 0 };
   vidx         sizeZ{ 0 };
   int          sampleNum{ 1024 };
+  bool         useCuda{ false };
   float        metricBefore{ 0.0f };
   float        metricAfter{ 0.0f };
 };
@@ -975,6 +976,44 @@ parallelFor(vidx count, Body body)
                     }
                 }
 
+                // Offer the whole cost volume to the GPU first. The kernel is
+                // bit-identical to the loop below -- one label per thread, with the sum
+                // over samples kept sequential inside that thread, so nothing is
+                // reassociated -- which is why this is a speed choice and not a
+                // numerical one. It declines when the shape does not suit it (too many
+                // samples for shared memory, volumes too large for the card), and then
+                // the CPU path runs exactly as it always has.
+                bool ranOnDevice = false;
+                if (ctx.useCuda) {
+                    cuda::OptimizationInputs gin;
+                    gin.fixed = fixed;
+                    gin.m = m; gin.n = n; gin.o = o;
+                    gin.movingi = movingi;
+                    gin.mi = mi; gin.ni = ni; gin.oi = oi;
+                    gin.gridx = gridx; gin.gridy = gridy; gin.gridz = gridz;
+                    gin.gridstep = gridstep;
+                    gin.sz1 = sz1;
+                    gin.len = len;
+                    gin.lengthfull = lengthfull;
+                    gin.yOff = yOff.data();
+                    gin.xOff = xOff.data();
+                    gin.zOff = zOff.data();
+                    gin.maxsamp = maxsamp;
+                    gin.randommode = randommode;
+                    gin.sampleIdx = randommode ? sampleIdx.data() : nullptr;
+                    gin.subpixel = subpixel;
+                    gin.hw_local = hw_local;
+                    gin.activeNodes = activeNodes;
+                    gin.epsilon = epsilon;
+                    gin.energy = energy;
+                    ranOnDevice = cuda::RunOptimization(gin);
+                }
+
+                // Everything from here to the matching brace is the CPU path, and is
+                // deliberately left at its original indentation: the diff that added
+                // this branch should show no change to the cost arithmetic itself.
+                if (!ranOnDevice) {
+
                 // Each node writes only energy[i + l*sz1], so nodes are independent and the
                 // chunks below are disjoint in both their reads and their writes.
                 parallelFor(sz1, [&](vidx nodeBegin, vidx nodeEnd) {
@@ -1162,6 +1201,9 @@ parallelFor(vidx count, Body body)
                     }
                 }
                 });
+
+                } // end CPU path
+
             }
 
             if (movingiOwned) { delete []movingi; }
@@ -1415,6 +1457,17 @@ RunDeformableRegistration(const float *                imgFixIn,
   ctx.sizeY = sizeY;
   ctx.sizeZ = sizeZ;
   ctx.sampleNum = params.sampleNum;
+  // Resolved once here rather than per call: Auto means "GPU if this build has CUDA
+  // and a device answers". Gpu is not validated here -- the CLI rejects it at startup
+  // so the failure arrives before any work is done, not after the linear stage.
+  ctx.useCuda = (params.device == Device::Gpu) ||
+                (params.device == Device::Auto && cuda::DeviceAvailable());
+  if (params.verbose)
+  {
+    std::cout << "  deformable cost volume on "
+              << (ctx.useCuda ? ("GPU: " + cuda::DeviceDescription()) : std::string("CPU"))
+              << std::endl;
+  }
 
   // Coarse-to-fine control-grid spacings: 30, 15, 8, 4 upstream (ceil-halving).
   // Cap the starting spacing so the coarsest grid still has several nodes per axis;

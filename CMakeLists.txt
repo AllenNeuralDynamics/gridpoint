@@ -50,10 +50,41 @@ find_package(ITK REQUIRED COMPONENTS
 )
 include(${ITK_USE_FILE})
 
+# ---------------------------------------------------------------------------
+# Optional CUDA backend for the deformable cost volume.
+#
+# Off by default: a machine with no CUDA toolkit must still build and run, and with
+# this off the binary is byte-for-byte the same program it was before the backend
+# existed -- the stub below supplies the same symbols and always declines.
+#
+# The GPU kernel is bit-identical to the CPU path, so switching backends cannot
+# change a result. See the contract at the top of src/StptDeformableCuda.h; the
+# --fmad=false below is load-bearing, not decorative.
+# ---------------------------------------------------------------------------
+option(GRIDPOINT_ENABLE_CUDA "Build the CUDA backend for the deformable cost volume" OFF)
+
+if(GRIDPOINT_ENABLE_CUDA)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    # Volta through Ampere as real code, plus PTX so a newer card still runs. Set
+    # explicitly rather than "native" for the same reason -march=native is avoided
+    # above: the Code Ocean capsule builds on one host and runs on another.
+    set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86 86-virtual)
+  endif()
+  set(GRIDPOINT_DEVICE_SOURCE src/StptDeformableCuda.cu)
+  message(STATUS "gridpoint: CUDA backend ON (architectures ${CMAKE_CUDA_ARCHITECTURES})")
+else()
+  set(GRIDPOINT_DEVICE_SOURCE src/StptDeformableCudaStub.cxx)
+  message(STATUS "gridpoint: CUDA backend OFF (-DGRIDPOINT_ENABLE_CUDA=ON to enable)")
+endif()
+
 add_executable(gridpoint
   src/gridpoint.cxx
   src/StptLinearRegistration.cxx
   src/StptDeformableMRF.cxx
+  ${GRIDPOINT_DEVICE_SOURCE}
 )
 target_include_directories(gridpoint PRIVATE src)
 target_compile_definitions(gridpoint PRIVATE
@@ -96,23 +127,47 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x86|i686")
     # /fp:strict does not cost the vectorization: MSVC still reports C5001 on the
     # hot label loop, and strict measures about 6% slower than precise on the whole
     # deformable stage. That 6% is what the bit-exactness guarantee costs.
-    target_compile_options(gridpoint PRIVATE /arch:AVX2 /fp:strict)
+    # Scoped to CXX: nvcc does not take MSVC switches directly, and the CUDA
+    # backend has its own float-contraction control (--fmad=false).
+    target_compile_options(gridpoint PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>
+                                             $<$<COMPILE_LANGUAGE:CXX>:/fp:strict>)
   else()
     include(CheckCXXCompilerFlag)
     check_cxx_compiler_flag("-march=x86-64-v3" GRIDPOINT_HAS_X86_64_V3)
     if(GRIDPOINT_HAS_X86_64_V3)
-      target_compile_options(gridpoint PRIVATE -march=x86-64-v3)
+      target_compile_options(gridpoint PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=x86-64-v3>)
     else()
       # Older toolchains predate the -v3 microarchitecture levels.
       check_cxx_compiler_flag("-mavx2" GRIDPOINT_HAS_AVX2)
       if(GRIDPOINT_HAS_AVX2)
-        target_compile_options(gridpoint PRIVATE -mavx2 -mfma)
+        target_compile_options(gridpoint PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2>
+                                                 $<$<COMPILE_LANGUAGE:CXX>:-mfma>)
       endif()
     endif()
   endif()
 endif()
 if(NOT MSVC)
-  target_compile_options(gridpoint PRIVATE -ffp-contract=off)
+  target_compile_options(gridpoint PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+endif()
+
+if(GRIDPOINT_ENABLE_CUDA)
+  # The exact counterpart of -ffp-contract=off / MSVC's /fp:strict, and required for
+  # the same reason: nvcc fuses a*b+c into an FMA by default, which rounds once
+  # instead of twice and would stop the GPU matching the CPU. Never add
+  # -use_fast_math here -- it re-enables contraction AND switches division to the
+  # approximate form, and the node index arithmetic divides by a float grid step.
+  target_compile_options(gridpoint PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+  # On MSVC the CUDA runtime has to match the C runtime everything else uses. ITK is
+  # built against the dynamic CRT, and nvcc defaults to the STATIC cudart, which drags
+  # in LIBCMT alongside MSVCRT -- two C runtimes, two heaps, two sets of global state,
+  # announced only as LNK4098. Elsewhere the static runtime is preferred, since it is
+  # one fewer shared object to ship.
+  if(MSVC)
+    set_target_properties(gridpoint PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+  else()
+    set_target_properties(gridpoint PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  endif()
 endif()
 
 

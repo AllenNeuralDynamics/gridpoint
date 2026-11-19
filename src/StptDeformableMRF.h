@@ -23,6 +23,8 @@
 #ifndef StptDeformableMRF_h
 #define StptDeformableMRF_h
 
+#include "StptDeformableCuda.h"
+
 #include <vector>
 
 namespace stpt
@@ -36,6 +38,10 @@ struct DeformableParameters
   float        lambda{ 1.0e-5f };   // smoothness weight on the MRF pairwise term
   int          sampleNum{ 1024 };   // random samples per node, quartered each level (floor 64)
   bool         verbose{ false };
+  // Which backend computes the cost volume. Auto uses the GPU when this build has
+  // CUDA and a device is present. The choice cannot change the result -- the CUDA
+  // kernel is bit-identical to the CPU loop -- so it is purely a speed knob.
+  Device       device{ Device::Auto };
 };
 
 /** Result of the deformable stage. All buffers are x-fastest, size sizeX*sizeY*sizeZ. */

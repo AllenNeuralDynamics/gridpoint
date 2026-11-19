@@ -67,6 +67,12 @@ PrintUsage(const char * argv0)
     << "  --fixed-mask <path>          metric mask for the fixed image\n"
     << "  --moving-mask <path>         metric mask for the moving image\n"
     << "  --threads <n>                maximum number of threads\n"
+    << "  --device auto|cpu|gpu        where the deformable cost volume runs.\n"
+    << "                               auto (default) uses the GPU when this build\n"
+    << "                               has CUDA and a device is present. gpu fails\n"
+    << "                               if there is not one. Results are identical\n"
+    << "                               either way -- the GPU kernel is bit-exact\n"
+    << "                               against the CPU loop.\n"
     << "  --bins <n>                   MI histogram bins (default 64)\n"
     << "  --linear-samples <n>         MI spatial samples (default 250000)\n"
     << "  --linear-iterations <n>      optimizer iterations per level (default 100)\n"
@@ -199,6 +205,19 @@ main(int argc, char * argv[])
       else if (arg == "--fixed-mask") { fixedMaskPath = next("--fixed-mask"); }
       else if (arg == "--moving-mask") { movingMaskPath = next("--moving-mask"); }
       else if (arg == "--threads") { threads = std::stoi(next("--threads")); }
+      else if (arg == "--device")
+      {
+        const std::string value = next("--device");
+        if (value == "auto") { defParams.device = stpt::Device::Auto; }
+        else if (value == "cpu") { defParams.device = stpt::Device::Cpu; }
+        else if (value == "gpu" || value == "cuda") { defParams.device = stpt::Device::Gpu; }
+        else
+        {
+          std::cerr << "error: --device takes 'auto', 'cpu' or 'gpu', not '" << value
+                    << "'." << std::endl;
+          return EXIT_FAILURE;
+        }
+      }
       else if (arg == "--bins") { params.numberOfHistogramBins = std::stoul(next("--bins")); }
       else if (arg == "--linear-samples") { params.numberOfSpatialSamples = std::stoul(next("--linear-samples")); }
       else if (arg == "--linear-iterations") { params.numberOfIterations = std::stoul(next("--linear-iterations")); }
@@ -285,6 +304,25 @@ main(int argc, char * argv[])
   {
     std::cerr << "error: --write-deformation-field needs the deformable stage" << std::endl;
     return EXIT_FAILURE;
+  }
+
+  // Resolve the device before reading a single voxel. An explicit --device gpu that
+  // cannot be honoured is a hard error here rather than a quiet fall back twenty
+  // minutes into a run.
+  if (defParams.device == stpt::Device::Gpu && !stpt::cuda::DeviceAvailable())
+  {
+    std::cerr << "error: --device gpu requested but " << stpt::cuda::UnavailableReason()
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+  const bool usingGpu =
+    defParams.device == stpt::Device::Gpu ||
+    (defParams.device == stpt::Device::Auto && stpt::cuda::DeviceAvailable());
+  const std::string deviceText =
+    usingGpu ? ("gpu (" + stpt::cuda::DeviceDescription() + ")") : std::string("cpu");
+  if (params.verbose)
+  {
+    std::cout << "device: " << deviceText << std::endl;
   }
 
   try
@@ -705,6 +743,7 @@ main(int argc, char * argv[])
         << "fixed: " << fixedPath << "\n"
         << "moving: " << movingPath << "\n"
         << "stages: " << stagesText << "\n"
+        << "device: " << deviceText << "\n"
         << "levels: " << params.numberOfLevels << "\n"
         << "bins: " << params.numberOfHistogramBins << "\n"
         << "spatial samples: " << params.numberOfSpatialSamples << "\n"
