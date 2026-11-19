@@ -92,6 +92,28 @@ public:
   }
 };
 
+/** Heap payload for the Prim loop below. Prim only ever compares weights, so the
+ *  endpoints need not be carried: an edge id (vertex * 6 + neighbour slot) recovers
+ *  both. That keeps the element at 8 bytes rather than Relation's 16, which is the
+ *  whole cost of this phase -- at the finest pyramid level the heap reaches ~3.9M
+ *  entries, and every push_heap/pop_heap walks a random path down it.
+ *
+ *  Bit-exactness: the weights compared here are the same floats the old double
+ *  members were widened from, and widening is order-preserving, so every comparison
+ *  answers exactly as before. The push and pop sequence is untouched. The heap
+ *  therefore has the same shape at every step and hands back the same edge even
+ *  where several tie -- which matters, because background edges tie at 0 in bulk. */
+struct HeapEdge
+{
+  float weight;
+  int   eid;
+  bool
+  operator<(const HeapEdge & b) const
+  {
+    return this->weight > b.weight;
+  }
+};
+
 /** Accept an edge only if it joins the tree to a vertex not yet in it. */
 int
 newRelation(Relation edge1, Relation & edgeout, bool * vertices)
@@ -188,7 +210,7 @@ parallelFor(vidx count, Body body)
 
             int num_vertices = xgridsize * ygridsize*zgridsize;
 
-            int num_neighbours = 6;
+            const int num_neighbours = 6;
             float* edgecost = new float[num_vertices * num_neighbours];
             int* index_neighbours = new int[num_vertices * num_neighbours];
             for (int i = 0; i < num_vertices * num_neighbours; i++) {
@@ -205,9 +227,17 @@ parallelFor(vidx count, Body body)
             for (int k = static_cast<int>(kBegin); k < static_cast<int>(kEnd); k++) {
                 for (int j = 0; j < ygridsize; j++) {
                     for (int i = 0; i < xgridsize; i++) {
-                        for (int nb = 0; nb < num_neighbours; nb++) {
+                        const int self = i + j * xgridsize + k * xgridsize * ygridsize;
+                        // Only the three positive directions are summed; the negative
+                        // ones are the same undirected edge approached from the other
+                        // end, and are mirrored in below.
+                        for (int nb = 1; nb < num_neighbours; nb += 2) {
                             if ((i + ydelta[nb]) >= 0 & (i + ydelta[nb]) < xgridsize & (j + xdelta[nb]) >= 0 & (j + xdelta[nb]) < ygridsize & (k + zdelta[nb]) >= 0 & (k + zdelta[nb]) < zgridsize) {
-                                index_neighbours[i + j * xgridsize + k * xgridsize * ygridsize + nb * num_vertices] = i + ydelta[nb]+(j + xdelta[nb]) * xgridsize + (k + zdelta[nb]) * xgridsize*ygridsize;
+                                index_neighbours[self * num_neighbours + nb] = i + ydelta[nb]+(j + xdelta[nb]) * xgridsize + (k + zdelta[nb]) * xgridsize*ygridsize;
+                                // Accumulating in a register rather than through the
+                                // array rounds at exactly the same points: both are
+                                // float += double, so both round once per term.
+                                float acc = 0.0f;
                                 for (int k1 = 0; k1 < stepsize; k1++) {
                                     for (int j1 = 0; j1 < stepsize; j1++) {
                                         for (int i1 = 0; i1 < stepsize; i1++) {
@@ -217,11 +247,46 @@ parallelFor(vidx count, Body body)
                                             const vidx xnew = (j + xdelta[nb]) * stepsize + j1;
                                             const vidx ynew = (i + ydelta[nb]) * stepsize + i1;
                                             const vidx znew = (k + zdelta[nb]) * stepsize + k1;
-                                            edgecost[i + j * xgridsize + k * xgridsize * ygridsize + nb * num_vertices] += fabs(dfmfld[y + x * xsize + z * xsize * ysize] - dfmfld[ynew + xnew * xsize + znew * xsize * ysize]);
+                                            acc += fabs(dfmfld[y + x * xsize + z * xsize * ysize] - dfmfld[ynew + xnew * xsize + znew * xsize * ysize]);
                                         }
                                     }
                                 }
+                                edgecost[self * num_neighbours + nb] = acc;
                             }
+                        }
+                    }
+                }
+            }
+            });
+
+            // Mirror the three positive directions into the negative slots. The terms
+            // are |a-b| against |b-a| in the same (k1,j1,i1) order, which in IEEE
+            // arithmetic are the same bits, so each mirrored weight is identical to
+            // the one the loop above used to compute for itself -- for half the
+            // arithmetic and half the memory traffic. It is a separate pass because
+            // the k-1 source lies in the previous chunk slab, which is only safe to
+            // read once the pass above has joined. An in-range positive edge has an
+            // in-range mirror by construction, so the bounds test reduces to whether
+            // there is a previous cell on this axis.
+            parallelFor(zgridsize, [&](vidx kBegin, vidx kEnd) {
+            for (int k = static_cast<int>(kBegin); k < static_cast<int>(kEnd); k++) {
+                for (int j = 0; j < ygridsize; j++) {
+                    for (int i = 0; i < xgridsize; i++) {
+                        const int self = i + j * xgridsize + k * xgridsize * ygridsize;
+                        if (j > 0) {
+                            const int from = self - xgridsize;
+                            index_neighbours[self * num_neighbours + 0] = from;
+                            edgecost[self * num_neighbours + 0] = edgecost[from * num_neighbours + 1];
+                        }
+                        if (i > 0) {
+                            const int from = self - 1;
+                            index_neighbours[self * num_neighbours + 2] = from;
+                            edgecost[self * num_neighbours + 2] = edgecost[from * num_neighbours + 3];
+                        }
+                        if (k > 0) {
+                            const int from = self - xgridsize * ygridsize;
+                            index_neighbours[self * num_neighbours + 4] = from;
+                            edgecost[self * num_neighbours + 4] = edgecost[from * num_neighbours + 5];
                         }
                     }
                 }
@@ -230,7 +295,10 @@ parallelFor(vidx count, Body body)
 
             int root = xgridsize / 2 + ygridsize / 2 * xgridsize + zgridsize / 2 * xgridsize*ygridsize;
 
-            std::vector<Relation> sorted;
+            std::vector<HeapEdge> sorted;
+            // The heap peaks near 2.7x num_vertices on real data. Reserving does not
+            // change the order, only the dozens of reallocations that copy it.
+            sorted.reserve(static_cast<size_t>(num_vertices) * 3);
             bool* vertices = new bool[num_vertices];
             int* level = new int[num_vertices];
             for (int i = 0; i < num_vertices; i++) {
@@ -247,18 +315,21 @@ parallelFor(vidx count, Body body)
             
             for (int i = 0; i < num_vertices - 1; i++) { // have all grids added
                 for (int j = 0; j < num_neighbours; j++) {
-                    int n = index_neighbours[last + j * num_vertices];
+                    const int eid = last * num_neighbours + j;
+                    int n = index_neighbours[eid];
                     if (n >= 0) {
-                        sorted.push_back(Relation(edgecost[last + j * num_vertices], last, n));
+                        sorted.push_back(HeapEdge{ edgecost[eid], eid });
                         push_heap(sorted.begin(), sorted.end());
                     }
                 }
                 last = -1;
                 //find lowest
                 while (last == -1) {
-                    minedge = sorted.front();
+                    const HeapEdge top = sorted.front();
                     pop_heap(sorted.begin(), sorted.end());
                     sorted.pop_back();
+                    minedge = Relation(top.weight, top.eid / num_neighbours,
+                                       index_neighbours[top.eid]);
                     last = newRelation(minedge, edgeout, vertices); //return next valid 
                 }
                 cost += edgeout.weight;
